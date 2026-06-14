@@ -112,6 +112,7 @@ app.post("/webhook", async (req, res) => {
   res.sendStatus(200); // Chatwoot ko turant OK
 
   const event = req.body;
+  console.log("FULL EVENT:", JSON.stringify({ event: event.event, type: event.message_type, content: event.content, content_type: event.content_type }));
   if (event.event !== "message_created") return;
   if (event.message_type !== "incoming") return;
 
