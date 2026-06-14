@@ -1,7 +1,7 @@
 {
   "name": "chatssync-bot",
   "version": "1.0.0",
-  "description": "ChatsSync chatbot engine - webhook listener + Chatwoot API replies",
+  "description": "ChatsSync chatbot engine - flows + sessions in Postgres",
   "main": "server.js",
   "type": "module",
   "scripts": {
@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "axios": "^1.7.7",
-    "express": "^4.21.1"
+    "express": "^4.21.1",
+    "pg": "^8.13.1"
   }
 }
