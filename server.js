@@ -13,8 +13,8 @@ const flow = JSON.parse(fs.readFileSync("./flow.json", "utf-8"));
 const app = express();
 app.use(express.json());
 
-// In-memory sessions: key = "accountId:conversationId" -> { nodeId, awaiting, variables }
-// NOTE: ye redeploy/restart par reset hota hai. Phase 8 mein Postgres se persist karenge.
+// In-memory sessions: key = "accountId:conversationId" -> { nodeId, awaiting, variables, started }
+// NOTE: redeploy par reset hota hai. Phase 8 mein Postgres se persist karenge.
 const sessions = new Map();
 const key = (a, c) => `${a}:${c}`;
 
@@ -57,7 +57,6 @@ async function sendButtons(accountId, conversationId, text, buttons) {
 }
 
 async function handover(accountId, conversationId) {
-  // Conversation ko "open" kar do taake human agent le sake
   try {
     await apiPost(
       `/api/v1/accounts/${accountId}/conversations/${conversationId}/toggle_status`,
@@ -73,36 +72,35 @@ async function runFlow(accountId, conversationId, session) {
   const k = key(accountId, conversationId);
   for (let i = 0; i < 50; i++) {
     const node = flow.nodes[session.nodeId];
-    if (!node) { sessions.delete(k); return; }
+    if (!node) { session.awaiting = null; session.nodeId = null; return; }
 
     if (node.type === "text") {
       await sendText(accountId, conversationId, node.text);
       if (node.next) { session.nodeId = node.next; continue; }
-      sessions.delete(k);
+      session.awaiting = null; session.nodeId = null; // flow khatam (session rehne do = khamosh)
       return;
     }
 
     if (node.type === "buttons") {
       await sendButtons(accountId, conversationId, node.text, node.buttons);
-      session.awaiting = "buttons"; // user ke choice ka intezaar
+      session.awaiting = "buttons";
       return;
     }
 
     if (node.type === "question") {
       await sendText(accountId, conversationId, node.text);
-      session.awaiting = "question"; // user ke jawab ka intezaar
+      session.awaiting = "question";
       return;
     }
 
     if (node.type === "handover") {
       if (node.text) await sendText(accountId, conversationId, node.text);
       await handover(accountId, conversationId);
-      sessions.delete(k);
+      session.awaiting = null; session.nodeId = null;
       return;
     }
 
-    // unknown node
-    sessions.delete(k);
+    session.awaiting = null; session.nodeId = null;
     return;
   }
 }
@@ -112,62 +110,59 @@ app.post("/webhook", async (req, res) => {
   res.sendStatus(200); // Chatwoot ko turant OK
 
   const event = req.body;
-  console.log("FULL EVENT:", JSON.stringify({ event: event.event, type: event.message_type, content: event.content, content_type: event.content_type }));
-  if (event.event === "message_updated") {
-    console.log("UPDATED EVENT FULL:", JSON.stringify(event.content_attributes || {}), "| content:", event.content);
-  }
-  if (event.event !== "message_created") return;
-  if (event.message_type !== "incoming") return;
-
   const accountId = event.account?.id;
   const conversationId = event.conversation?.id;
-  const text = (event.content || "").trim();
   if (!accountId || !conversationId) return;
 
-  const lower = text.toLowerCase();
   const k = key(accountId, conversationId);
   let session = sessions.get(k);
 
-  console.log(`Incoming: "${text}" (conv ${conversationId})`);
+  // ===== CASE 1: BUTTON CLICK (message_updated + submitted_values) =====
+  const submitted = event.content_attributes?.submitted_values;
+  if (event.event === "message_updated" && Array.isArray(submitted) && submitted.length > 0) {
+    const choice = (submitted[0].value || submitted[0].title || "").trim();
+    console.log(`Button click: "${choice}" (conv ${conversationId})`);
 
-  // Reset keywords ya nayi conversation -> flow shuru
-  if (!session || ["menu", "restart", "start", "hi", "hello"].includes(lower)) {
-    session = { nodeId: flow.start, awaiting: null, variables: {} };
-    sessions.set(k, session);
-    await runFlow(accountId, conversationId, session);
-    return;
+    // Agar session button ka intezaar kar raha hai -> us choice par aage badho
+    if (session && session.awaiting === "buttons") {
+      const node = flow.nodes[session.nodeId];
+      const btn = node?.buttons?.find(
+        (b) => b.title.toLowerCase() === choice.toLowerCase()
+      );
+      if (btn) {
+        session.awaiting = null;
+        session.nodeId = btn.next;
+        await runFlow(accountId, conversationId, session);
+      }
+    }
+    return; // button click handle ho gaya
   }
 
-  const node = flow.nodes[session.nodeId];
-  if (!node) { sessions.delete(k); return; }
+  // ===== CASE 2: NORMAL INCOMING TEXT (message_created + incoming) =====
+  if (event.event !== "message_created") return;
+  if (event.message_type !== "incoming") return; // template/outgoing ignore
 
-  // Buttons ka intezaar
-  if (session.awaiting === "buttons") {
-    const btn = node.buttons.find(
-      (b) => b.title.toLowerCase() === lower
-    );
-    if (!btn) {
-      await sendText(accountId, conversationId, "Upar diye options mein se ek chunein 🙂");
-      await sendButtons(accountId, conversationId, node.text, node.buttons);
+  const text = (event.content || "").trim();
+  console.log(`Incoming text: "${text}" (conv ${conversationId})`);
+
+  // Agar flow pehle se chal raha hai...
+  if (session) {
+    // Question ka intezaar -> jawab save karke aage
+    if (session.awaiting === "question") {
+      const node = flow.nodes[session.nodeId];
+      if (node?.save_as) session.variables[node.save_as] = text;
+      session.awaiting = null;
+      session.nodeId = node?.next || null;
+      await runFlow(accountId, conversationId, session);
       return;
     }
-    session.awaiting = null;
-    session.nodeId = btn.next;
-    await runFlow(accountId, conversationId, session);
+    // Buttons ka intezaar, magr user ne text likha -> KHAMOSH (kuch na karo)
+    // Flow khatam ho chuka -> KHAMOSH
     return;
   }
 
-  // Question ka intezaar
-  if (session.awaiting === "question") {
-    if (node.save_as) session.variables[node.save_as] = text;
-    session.awaiting = null;
-    session.nodeId = node.next;
-    await runFlow(accountId, conversationId, session);
-    return;
-  }
-
-  // fallback -> dobara shuru
-  session = { nodeId: flow.start, awaiting: null, variables: {} };
+  // ===== Naya customer, pehla message -> flow EK BAAR trigger karo =====
+  session = { nodeId: flow.start, awaiting: null, variables: {}, started: true };
   sessions.set(k, session);
   await runFlow(accountId, conversationId, session);
 });
