@@ -1,0 +1,47 @@
+{
+  "start": "welcome",
+  "nodes": {
+    "welcome": {
+      "type": "buttons",
+      "text": "Hello 👋 Welcome to ChatsSync! Main kis cheez mein madad karun?",
+      "buttons": [
+        { "title": "Pricing", "next": "pricing" },
+        { "title": "Features", "next": "features" },
+        { "title": "Talk to a human", "next": "handover" }
+      ]
+    },
+    "pricing": {
+      "type": "text",
+      "text": "💰 Hamare plans:\n• Basic — PKR 1,000/month\n• Pro — PKR 3,000/month\n• Business — PKR 6,000/month",
+      "next": "anything_else"
+    },
+    "features": {
+      "type": "text",
+      "text": "✨ ChatsSync features:\n• Omnichannel inbox\n• Visual chatbot builder\n• Team collaboration\n• Reports & analytics",
+      "next": "anything_else"
+    },
+    "anything_else": {
+      "type": "buttons",
+      "text": "Aur kuch?",
+      "buttons": [
+        { "title": "Main menu", "next": "welcome" },
+        { "title": "Nahi, shukriya", "next": "ask_feedback" }
+      ]
+    },
+    "ask_feedback": {
+      "type": "question",
+      "text": "Theek hai! Jaane se pehle — aapka experience kaisa raha? (apne shabdon mein likhein)",
+      "save_as": "feedback",
+      "next": "thanks"
+    },
+    "thanks": {
+      "type": "text",
+      "text": "Shukriya feedback ke liye 🙏 Achha din ho!",
+      "next": null
+    },
+    "handover": {
+      "type": "handover",
+      "text": "Bilkul! Main aapko ek human agent se jod raha hoon. Thodi der mein koi aapse baat karega 🙌"
+    }
+  }
+}
