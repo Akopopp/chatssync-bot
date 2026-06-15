@@ -1,13 +1,11 @@
 import pg from "pg";
 const { Pool } = pg;
 
-// Coolify se DATABASE_URL env aayega (internal connection string)
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.DATABASE_SSL === "true" ? { rejectUnauthorized: false } : false,
 });
 
-// ---------- Tables banao (agar nahi hain) ----------
 export async function initDb() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS flows (
@@ -34,10 +32,9 @@ export async function initDb() {
       UNIQUE (account_id, conversation_id)
     );
   `);
-  console.log("DB tables ready ✅");
+  console.log("DB tables ready");
 }
 
-// ---------- Default flow seed karo (sirf agar account ka koi flow na ho) ----------
 export async function seedFlowIfEmpty(accountId, definition) {
   const { rows } = await pool.query(
     `SELECT id FROM flows WHERE account_id = $1 LIMIT 1`,
@@ -53,7 +50,6 @@ export async function seedFlowIfEmpty(accountId, definition) {
   }
 }
 
-// ---------- Published flow lao ----------
 export async function getPublishedFlow(accountId) {
   const { rows } = await pool.query(
     `SELECT * FROM flows WHERE account_id = $1 AND status = 'published'
@@ -63,7 +59,6 @@ export async function getPublishedFlow(accountId) {
   return rows[0] || null;
 }
 
-// ---------- Session lao ----------
 export async function getSession(accountId, conversationId) {
   const { rows } = await pool.query(
     `SELECT * FROM bot_sessions WHERE account_id = $1 AND conversation_id = $2`,
@@ -72,7 +67,6 @@ export async function getSession(accountId, conversationId) {
   return rows[0] || null;
 }
 
-// ---------- Session save karo (insert ya update) ----------
 export async function saveSession(accountId, conversationId, s) {
   await pool.query(
     `INSERT INTO bot_sessions (account_id, conversation_id, node_id, awaiting, variables, flow_published_at, updated_at)
