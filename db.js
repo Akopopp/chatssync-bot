@@ -47,17 +47,12 @@ export async function seedFlowIfEmpty(accountId, definition) {
   }
 }
 
-// Engine routing (B): inbox ka published flow; na mile to default (inbox NULL)
+// Engine routing (B): SIRF us inbox ka published flow. None (inbox NULL) = OFF, koi fallback nahi.
 export async function getPublishedFlowForInbox(accountId, inboxId) {
-  if (inboxId != null) {
-    const { rows } = await pool.query(
-      `SELECT * FROM flows WHERE account_id=$1 AND inbox_id=$2 AND status='published'
-       ORDER BY published_at DESC LIMIT 1`, [accountId, inboxId]);
-    if (rows[0]) return rows[0];
-  }
+  if (inboxId == null) return null;
   const { rows } = await pool.query(
-    `SELECT * FROM flows WHERE account_id=$1 AND inbox_id IS NULL AND status='published'
-     ORDER BY published_at DESC LIMIT 1`, [accountId]);
+    `SELECT * FROM flows WHERE account_id=$1 AND inbox_id=$2 AND status='published'
+     ORDER BY published_at DESC LIMIT 1`, [accountId, inboxId]);
   return rows[0] || null;
 }
 
@@ -89,7 +84,6 @@ export async function saveFlowById(id, name, definition) {
 export async function publishFlowById(id) {
   const cur = await getFlowById(id);
   if (!cur) return null;
-  // ek inbox par ek hi live: same inbox ke baaki draft kar do
   await pool.query(
     `UPDATE flows SET status='draft', updated_at=NOW()
      WHERE account_id=$1 AND id<>$2 AND inbox_id IS NOT DISTINCT FROM $3 AND status='published'`,
@@ -104,21 +98,16 @@ export async function unpublishFlowById(id) {
     `UPDATE flows SET status='draft', updated_at=NOW() WHERE id=$1 RETURNING *`, [id]);
   return rows[0] || null;
 }
-export async function deleteFlowById(id) {
-  await pool.query(`DELETE FROM flows WHERE id=$1`, [id]);
-}
+export async function deleteFlowById(id) { await pool.query(`DELETE FROM flows WHERE id=$1`, [id]); }
 export async function assignInbox(id, inboxId) {
   const { rows } = await pool.query(
-    `UPDATE flows SET inbox_id=$2, updated_at=NOW() WHERE id=$1 RETURNING *`,
-    [id, inboxId ?? null]);
+    `UPDATE flows SET inbox_id=$2, updated_at=NOW() WHERE id=$1 RETURNING *`, [id, inboxId ?? null]);
   return rows[0] || null;
 }
 
-// ===== sessions =====
 export async function getSession(accountId, conversationId) {
   const { rows } = await pool.query(
-    `SELECT * FROM bot_sessions WHERE account_id=$1 AND conversation_id=$2`,
-    [accountId, conversationId]);
+    `SELECT * FROM bot_sessions WHERE account_id=$1 AND conversation_id=$2`, [accountId, conversationId]);
   return rows[0] || null;
 }
 export async function saveSession(accountId, conversationId, s) {
