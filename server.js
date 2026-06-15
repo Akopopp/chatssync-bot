@@ -1,86 +1,154 @@
-import pg from "pg";
-const { Pool } = pg;
+import express from "express";
+import axios from "axios";
+import fs from "fs";
+import { initDb, seedFlowIfEmpty, getPublishedFlow, getSession, saveSession } from "./db.js";
 
-// Coolify se DATABASE_URL env aayega (internal connection string)
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_SSL === "true" ? { rejectUnauthorized: false } : false,
-});
+const PORT = process.env.PORT || 3000;
+const CHATWOOT_BASE_URL = process.env.CHATWOOT_BASE_URL;
+const BOT_TOKEN = process.env.CHATWOOT_BOT_TOKEN;
 
-// ---------- Tables banao (agar nahi hain) ----------
-export async function initDb() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS flows (
-      id SERIAL PRIMARY KEY,
-      account_id INTEGER NOT NULL,
-      name TEXT NOT NULL DEFAULT 'Default flow',
-      definition JSONB NOT NULL,
-      status TEXT NOT NULL DEFAULT 'published',
-      published_at TIMESTAMPTZ DEFAULT NOW(),
-      created_at TIMESTAMPTZ DEFAULT NOW(),
-      updated_at TIMESTAMPTZ DEFAULT NOW()
-    );
-  `);
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS bot_sessions (
-      id SERIAL PRIMARY KEY,
-      account_id INTEGER NOT NULL,
-      conversation_id INTEGER NOT NULL,
-      node_id TEXT,
-      awaiting TEXT,
-      variables JSONB NOT NULL DEFAULT '{}'::jsonb,
-      flow_published_at TIMESTAMPTZ,
-      updated_at TIMESTAMPTZ DEFAULT NOW(),
-      UNIQUE (account_id, conversation_id)
-    );
-  `);
-  console.log("DB tables ready ✅");
+const seedFlow = JSON.parse(fs.readFileSync("./flow.json", "utf-8"));
+
+const app = express();
+app.use(express.json());
+
+app.get("/", (req, res) => res.send("ChatsSync bot engine is running"));
+
+async function apiPost(path, body) {
+  return axios.post(`${CHATWOOT_BASE_URL}${path}`, body, {
+    headers: { api_access_token: BOT_TOKEN },
+  });
+}
+async function sendText(accountId, conversationId, text) {
+  try {
+    await apiPost(`/api/v1/accounts/${accountId}/conversations/${conversationId}/messages`,
+      { content: text, message_type: "outgoing" });
+  } catch (e) { console.error("sendText error:", e.response?.data || e.message); }
+}
+async function sendButtons(accountId, conversationId, text, buttons) {
+  try {
+    await apiPost(`/api/v1/accounts/${accountId}/conversations/${conversationId}/messages`, {
+      content: text,
+      message_type: "outgoing",
+      content_type: "input_select",
+      content_attributes: { items: buttons.map((b) => ({ title: b.title, value: b.title })) },
+    });
+  } catch (e) { console.error("sendButtons error:", e.response?.data || e.message); }
+}
+async function handover(accountId, conversationId) {
+  try {
+    await apiPost(`/api/v1/accounts/${accountId}/conversations/${conversationId}/toggle_status`,
+      { status: "open" });
+  } catch (e) { console.error("handover error:", e.response?.data || e.message); }
 }
 
-// ---------- Default flow seed karo (sirf agar account ka koi flow na ho) ----------
-export async function seedFlowIfEmpty(accountId, definition) {
-  const { rows } = await pool.query(
-    `SELECT id FROM flows WHERE account_id = $1 LIMIT 1`,
-    [accountId]
-  );
-  if (rows.length === 0) {
-    await pool.query(
-      `INSERT INTO flows (account_id, name, definition, status, published_at)
-       VALUES ($1, $2, $3, 'published', NOW())`,
-      [accountId, "Default flow", JSON.stringify(definition)]
-    );
-    console.log(`Seeded default flow for account ${accountId}`);
+function toSession(row, flowPublishedAt) {
+  return {
+    nodeId: row.node_id,
+    awaiting: row.awaiting,
+    variables: typeof row.variables === "string" ? JSON.parse(row.variables) : (row.variables || {}),
+    flowPublishedAt: row.flow_published_at ? new Date(row.flow_published_at).toISOString() : flowPublishedAt,
+  };
+}
+
+async function runFlow(accountId, conversationId, s, def) {
+  for (let i = 0; i < 50; i++) {
+    const node = def.nodes[s.nodeId];
+    if (!node) { s.awaiting = null; s.nodeId = null; return; }
+
+    if (node.type === "text") {
+      await sendText(accountId, conversationId, node.text);
+      if (node.next) { s.nodeId = node.next; continue; }
+      s.awaiting = null; s.nodeId = null; return;
+    }
+    if (node.type === "buttons") {
+      await sendButtons(accountId, conversationId, node.text, node.buttons);
+      s.awaiting = "buttons"; return;
+    }
+    if (node.type === "question") {
+      await sendText(accountId, conversationId, node.text);
+      s.awaiting = "question"; return;
+    }
+    if (node.type === "handover") {
+      if (node.text) await sendText(accountId, conversationId, node.text);
+      await handover(accountId, conversationId);
+      s.awaiting = null; s.nodeId = null; return;
+    }
+    s.awaiting = null; s.nodeId = null; return;
   }
 }
 
-// ---------- Published flow lao ----------
-export async function getPublishedFlow(accountId) {
-  const { rows } = await pool.query(
-    `SELECT * FROM flows WHERE account_id = $1 AND status = 'published'
-     ORDER BY published_at DESC LIMIT 1`,
-    [accountId]
-  );
-  return rows[0] || null;
-}
+app.post("/webhook", async (req, res) => {
+  res.sendStatus(200);
+  try {
+    const event = req.body;
+    const accountId = event.account?.id;
+    const conversationId = event.conversation?.id;
+    if (!accountId || !conversationId) return;
 
-// ---------- Session lao ----------
-export async function getSession(accountId, conversationId) {
-  const { rows } = await pool.query(
-    `SELECT * FROM bot_sessions WHERE account_id = $1 AND conversation_id = $2`,
-    [accountId, conversationId]
-  );
-  return rows[0] || null;
-}
+    const flowRow = await getPublishedFlow(accountId);
+    if (!flowRow) { console.log(`No published flow for account ${accountId}`); return; }
+    const def = typeof flowRow.definition === "string" ? JSON.parse(flowRow.definition) : flowRow.definition;
+    const flowPublishedAt = new Date(flowRow.published_at).toISOString();
 
-// ---------- Session save karo (insert ya update) ----------
-export async function saveSession(accountId, conversationId, s) {
-  await pool.query(
-    `INSERT INTO bot_sessions (account_id, conversation_id, node_id, awaiting, variables, flow_published_at, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, NOW())
-     ON CONFLICT (account_id, conversation_id)
-     DO UPDATE SET node_id = $3, awaiting = $4, variables = $5, flow_published_at = $6, updated_at = NOW()`,
-    [accountId, conversationId, s.nodeId, s.awaiting, JSON.stringify(s.variables || {}), s.flowPublishedAt]
-  );
-}
+    const session = await getSession(accountId, conversationId);
 
-export { pool };
+    // BUTTON CLICK
+    const submitted = event.content_attributes?.submitted_values;
+    if (event.event === "message_updated" && Array.isArray(submitted) && submitted.length > 0) {
+      const choice = (submitted[0].value || submitted[0].title || "").trim();
+      console.log(`Button click: "${choice}" (conv ${conversationId})`);
+      if (session && session.awaiting === "buttons" && session.node_id) {
+        const node = def.nodes[session.node_id];
+        const btn = node?.buttons?.find((b) => b.title.toLowerCase() === choice.toLowerCase());
+        if (btn) {
+          const s = toSession(session, flowPublishedAt);
+          s.nodeId = btn.next; s.awaiting = null;
+          await runFlow(accountId, conversationId, s, def);
+          await saveSession(accountId, conversationId, s);
+        }
+      }
+      return;
+    }
+
+    // NORMAL INCOMING TEXT
+    if (event.event !== "message_created") return;
+    if (event.message_type !== "incoming") return;
+    const text = (event.content || "").trim();
+    console.log(`Incoming text: "${text}" (conv ${conversationId})`);
+
+    const isRepublished =
+      session && session.flow_published_at &&
+      new Date(session.flow_published_at).getTime() < new Date(flowPublishedAt).getTime();
+
+    if (!session || isRepublished) {
+      const s = { nodeId: def.start, awaiting: null, variables: {}, flowPublishedAt };
+      await runFlow(accountId, conversationId, s, def);
+      await saveSession(accountId, conversationId, s);
+      return;
+    }
+
+    if (session.awaiting === "question") {
+      const node = def.nodes[session.node_id];
+      const s = toSession(session, flowPublishedAt);
+      if (node?.save_as) s.variables[node.save_as] = text;
+      s.awaiting = null;
+      s.nodeId = node?.next || null;
+      await runFlow(accountId, conversationId, s, def);
+      await saveSession(accountId, conversationId, s);
+      return;
+    }
+
+    // buttons ka intezaar tha magr text aaya, ya flow khatam -> khamosh
+    return;
+  } catch (e) {
+    console.error("webhook error:", e.message);
+  }
+});
+
+async function start() {
+  await initDb();
+  await seedFlowIfEmpty(1, seedFlow);
+  app.listen(PORT, () => console.log(`ChatsSync bot engine listening on port ${PORT}`));
+}
+start().catch((e) => { console.error("Startup error:", e.message); process.exit(1); });
