@@ -148,7 +148,7 @@ app.post("/webhook", async (req, res) => {
 
 async function start() {
   await initDb();
-  await seedFlowIfEmpty(1, seedFlow);
+  await seedFlowIfEmpty(3, seedFlow);
   app.listen(PORT, () => console.log(`ChatsSync bot engine listening on port ${PORT}`));
 }
 start().catch((e) => { console.error("Startup error:", e.message); process.exit(1); });
