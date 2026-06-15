@@ -59,6 +59,53 @@ export async function getPublishedFlow(accountId) {
   return rows[0] || null;
 }
 
+// Builder ke liye: account ka flow lao (chahe draft ho ya published) — sabse naya
+export async function getFlowForEditing(accountId) {
+  const { rows } = await pool.query(
+    `SELECT * FROM flows WHERE account_id = $1 ORDER BY updated_at DESC LIMIT 1`,
+    [accountId]
+  );
+  return rows[0] || null;
+}
+
+// Builder ke liye: flow save karo (agar hai to update, warna naya banao)
+export async function saveFlow(accountId, name, definition, publish) {
+  const existing = await getFlowForEditing(accountId);
+  const status = publish ? "published" : "draft";
+
+  if (existing) {
+    const { rows } = await pool.query(
+      `UPDATE flows
+       SET name = $2, definition = $3, status = $4, updated_at = NOW(),
+           published_at = CASE WHEN $5 THEN NOW() ELSE published_at END
+       WHERE id = $1
+       RETURNING *`,
+      [existing.id, name || existing.name, JSON.stringify(definition), status, !!publish]
+    );
+    return rows[0];
+  } else {
+    const { rows } = await pool.query(
+      `INSERT INTO flows (account_id, name, definition, status, published_at)
+       VALUES ($1, $2, $3, $4, CASE WHEN $5 THEN NOW() ELSE NULL END)
+       RETURNING *`,
+      [accountId, name || "My flow", JSON.stringify(definition), status, !!publish]
+    );
+    return rows[0];
+  }
+}
+
+// Publish: latest flow ko published karo + published_at abhi (reactivate trigger)
+export async function publishFlow(accountId) {
+  const existing = await getFlowForEditing(accountId);
+  if (!existing) return null;
+  const { rows } = await pool.query(
+    `UPDATE flows SET status = 'published', published_at = NOW(), updated_at = NOW()
+     WHERE id = $1 RETURNING *`,
+    [existing.id]
+  );
+  return rows[0];
+}
+
 export async function getSession(accountId, conversationId) {
   const { rows } = await pool.query(
     `SELECT * FROM bot_sessions WHERE account_id = $1 AND conversation_id = $2`,
