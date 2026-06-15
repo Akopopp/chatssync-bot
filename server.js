@@ -1,7 +1,10 @@
 import express from "express";
 import axios from "axios";
 import fs from "fs";
-import { initDb, seedFlowIfEmpty, getPublishedFlow, getSession, saveSession } from "./db.js";
+import {
+  initDb, seedFlowIfEmpty, getPublishedFlow, getSession, saveSession,
+  getFlowForEditing, saveFlow, publishFlow,
+} from "./db.js";
 
 const PORT = process.env.PORT || 3000;
 const CHATWOOT_BASE_URL = process.env.CHATWOOT_BASE_URL;
@@ -10,9 +13,74 @@ const BOT_TOKEN = process.env.CHATWOOT_BOT_TOKEN;
 const seedFlow = JSON.parse(fs.readFileSync("./flow.json", "utf-8"));
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "2mb" }));
+
+// ---------- CORS (builder alag origin se call karega) ----------
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type");
+  if (req.method === "OPTIONS") return res.sendStatus(200);
+  next();
+});
 
 app.get("/", (req, res) => res.send("ChatsSync bot engine is running"));
+
+// =====================================================================
+// FLOW API (builder ke liye)
+// =====================================================================
+
+// Flow load karo (builder open par)
+app.get("/api/flow", async (req, res) => {
+  try {
+    const accountId = parseInt(req.query.account_id, 10);
+    if (!accountId) return res.status(400).json({ error: "account_id required" });
+    const row = await getFlowForEditing(accountId);
+    if (!row) return res.json({ flow: null });
+    const definition = typeof row.definition === "string" ? JSON.parse(row.definition) : row.definition;
+    res.json({
+      flow: { id: row.id, name: row.name, status: row.status, definition },
+    });
+  } catch (e) {
+    console.error("GET /api/flow error:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Flow save karo (draft). Body: { account_id, name, definition, publish? }
+app.post("/api/flow", async (req, res) => {
+  try {
+    const { account_id, name, definition, publish } = req.body || {};
+    const accountId = parseInt(account_id, 10);
+    if (!accountId) return res.status(400).json({ error: "account_id required" });
+    if (!definition || !definition.nodes || !definition.start) {
+      return res.status(400).json({ error: "definition with start + nodes required" });
+    }
+    const row = await saveFlow(accountId, name, definition, !!publish);
+    res.json({ ok: true, flow: { id: row.id, name: row.name, status: row.status } });
+  } catch (e) {
+    console.error("POST /api/flow error:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Publish karo (reactivate trigger). Body: { account_id }
+app.post("/api/flow/publish", async (req, res) => {
+  try {
+    const accountId = parseInt((req.body || {}).account_id, 10);
+    if (!accountId) return res.status(400).json({ error: "account_id required" });
+    const row = await publishFlow(accountId);
+    if (!row) return res.status(404).json({ error: "no flow to publish" });
+    res.json({ ok: true, flow: { id: row.id, status: row.status, published_at: row.published_at } });
+  } catch (e) {
+    console.error("POST /api/flow/publish error:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// =====================================================================
+// CHATWOOT BOT (engine) — wahi logic
+// =====================================================================
 
 async function apiPost(path, body) {
   return axios.post(`${CHATWOOT_BASE_URL}${path}`, body, {
@@ -35,7 +103,6 @@ async function sendButtons(accountId, conversationId, text, buttons) {
     });
   } catch (e) { console.error("sendButtons error:", e.response?.data || e.message); }
 }
-// Conversation ko "open" karo taake inbox mein dikhe (agent ko visible)
 async function openConversation(accountId, conversationId) {
   try {
     await apiPost(`/api/v1/accounts/${accountId}/conversations/${conversationId}/toggle_status`,
@@ -94,7 +161,6 @@ app.post("/webhook", async (req, res) => {
 
     const session = await getSession(accountId, conversationId);
 
-    // BUTTON CLICK (message_updated + submitted_values)
     const submitted = event.content_attributes?.submitted_values;
     if (event.event === "message_updated" && Array.isArray(submitted) && submitted.length > 0) {
       const choice = (submitted[0].value || submitted[0].title || "").trim();
@@ -112,7 +178,6 @@ app.post("/webhook", async (req, res) => {
       return;
     }
 
-    // Sirf customer ke incoming text par react karo (agent/outgoing/template ignore)
     if (event.event !== "message_created") return;
     if (event.message_type !== "incoming") return;
     const text = (event.content || "").trim();
@@ -122,9 +187,8 @@ app.post("/webhook", async (req, res) => {
       session && session.flow_published_at &&
       new Date(session.flow_published_at).getTime() < new Date(flowPublishedAt).getTime();
 
-    // Naya customer YA republish -> flow ek baar trigger + conversation ko inbox mein "open" karo
     if (!session || isRepublished) {
-      await openConversation(accountId, conversationId); // chat foran inbox mein dikhe
+      await openConversation(accountId, conversationId);
       const s = { nodeId: def.start, awaiting: null, variables: {}, flowPublishedAt };
       await runFlow(accountId, conversationId, s, def);
       await saveSession(accountId, conversationId, s);
@@ -142,7 +206,6 @@ app.post("/webhook", async (req, res) => {
       return;
     }
 
-    // buttons ka intezaar tha magr text aaya, ya flow khatam -> bot khamosh (agent baat kar sakta)
     return;
   } catch (e) {
     console.error("webhook error:", e.message);
