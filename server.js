@@ -35,11 +35,12 @@ async function sendButtons(accountId, conversationId, text, buttons) {
     });
   } catch (e) { console.error("sendButtons error:", e.response?.data || e.message); }
 }
-async function handover(accountId, conversationId) {
+// Conversation ko "open" karo taake inbox mein dikhe (agent ko visible)
+async function openConversation(accountId, conversationId) {
   try {
     await apiPost(`/api/v1/accounts/${accountId}/conversations/${conversationId}/toggle_status`,
       { status: "open" });
-  } catch (e) { console.error("handover error:", e.response?.data || e.message); }
+  } catch (e) { console.error("openConversation error:", e.response?.data || e.message); }
 }
 
 function toSession(row, flowPublishedAt) {
@@ -71,7 +72,7 @@ async function runFlow(accountId, conversationId, s, def) {
     }
     if (node.type === "handover") {
       if (node.text) await sendText(accountId, conversationId, node.text);
-      await handover(accountId, conversationId);
+      await openConversation(accountId, conversationId);
       s.awaiting = null; s.nodeId = null; return;
     }
     s.awaiting = null; s.nodeId = null; return;
@@ -93,7 +94,7 @@ app.post("/webhook", async (req, res) => {
 
     const session = await getSession(accountId, conversationId);
 
-    // BUTTON CLICK
+    // BUTTON CLICK (message_updated + submitted_values)
     const submitted = event.content_attributes?.submitted_values;
     if (event.event === "message_updated" && Array.isArray(submitted) && submitted.length > 0) {
       const choice = (submitted[0].value || submitted[0].title || "").trim();
@@ -111,7 +112,7 @@ app.post("/webhook", async (req, res) => {
       return;
     }
 
-    // NORMAL INCOMING TEXT
+    // Sirf customer ke incoming text par react karo (agent/outgoing/template ignore)
     if (event.event !== "message_created") return;
     if (event.message_type !== "incoming") return;
     const text = (event.content || "").trim();
@@ -121,7 +122,9 @@ app.post("/webhook", async (req, res) => {
       session && session.flow_published_at &&
       new Date(session.flow_published_at).getTime() < new Date(flowPublishedAt).getTime();
 
+    // Naya customer YA republish -> flow ek baar trigger + conversation ko inbox mein "open" karo
     if (!session || isRepublished) {
+      await openConversation(accountId, conversationId); // chat foran inbox mein dikhe
       const s = { nodeId: def.start, awaiting: null, variables: {}, flowPublishedAt };
       await runFlow(accountId, conversationId, s, def);
       await saveSession(accountId, conversationId, s);
@@ -139,7 +142,7 @@ app.post("/webhook", async (req, res) => {
       return;
     }
 
-    // buttons ka intezaar tha magr text aaya, ya flow khatam -> khamosh
+    // buttons ka intezaar tha magr text aaya, ya flow khatam -> bot khamosh (agent baat kar sakta)
     return;
   } catch (e) {
     console.error("webhook error:", e.message);
