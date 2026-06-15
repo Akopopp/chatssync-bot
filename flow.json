@@ -30,7 +30,7 @@
     },
     "ask_feedback": {
       "type": "question",
-      "text": "Theek hai! Jaane se pehle — aapka experience kaisa raha? (apne shabdon mein likhein)",
+      "text": "Theek hai! Jaane se pehle — aapka experience kaisa raha?",
       "save_as": "feedback",
       "next": "thanks"
     },
