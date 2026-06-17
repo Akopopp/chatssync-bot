@@ -3,6 +3,7 @@ import axios from "axios";
 import fs from "fs";
 import path from "path";
 import multer from "multer";
+import FormData from "form-data";
 import {
   initDb, seedFlowIfEmpty, getPublishedFlowForInbox, getSession, saveSession,
   listFlows, createFlow, getFlowById, saveFlowById, publishFlowById, unpublishFlowById, deleteFlowById, assignInbox,
@@ -91,12 +92,41 @@ async function sendText(a, c, text) { try { await apiPost(`/api/v1/accounts/${a}
 async function sendButtons(a, c, text, buttons) { try { await apiPost(`/api/v1/accounts/${a}/conversations/${c}/messages`, { content: text, message_type: "outgoing", content_type: "input_select", content_attributes: { items: buttons.map((b) => ({ title: b.title, value: b.title })) } }); } catch (e) { console.error("sendButtons", e.response?.data || e.message); } }
 async function openConversation(a, c) { try { await apiPost(`/api/v1/accounts/${a}/conversations/${c}/toggle_status`, { status: "open" }); } catch (e) { console.error("openConversation", e.response?.data || e.message); } }
 
+// Map a file extension to a MIME type (Chatwoot needs the content type for attachments)
+function extToMime(name) {
+  const ext = (String(name).split("?")[0].split(".").pop() || "").toLowerCase();
+  const map = { jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", gif: "image/gif", webp: "image/webp", bmp: "image/bmp", svg: "image/svg+xml", mp4: "video/mp4", webm: "video/webm", mov: "video/quicktime", mkv: "video/x-matroska", mp3: "audio/mpeg", ogg: "audio/ogg", wav: "audio/wav", m4a: "audio/mp4", aac: "audio/aac", pdf: "application/pdf" };
+  return map[ext] || "application/octet-stream";
+}
+// Send a media file to Chatwoot as a real attachment (multipart/form-data, attachments[])
+async function sendMedia(a, c, url, caption) {
+  try {
+    if (!url) return;
+    const clean = String(url).split("?")[0];
+    const baseName = decodeURIComponent(clean.split("/uploads/")[1] || clean.split("/").pop() || "file");
+    const localPath = path.join(UPLOAD_DIR, path.basename(baseName));
+    let buffer;
+    if (clean.includes("/uploads/") && fs.existsSync(localPath)) {
+      buffer = fs.readFileSync(localPath); // gallery file lives on our own disk
+    } else {
+      const resp = await axios.get(url, { responseType: "arraybuffer", maxContentLength: Infinity, maxBodyLength: Infinity }); // external / pasted link
+      buffer = Buffer.from(resp.data);
+    }
+    const form = new FormData();
+    if (caption) form.append("content", caption);
+    form.append("message_type", "outgoing");
+    form.append("attachments[]", buffer, { filename: path.basename(baseName), contentType: extToMime(baseName) });
+    await axios.post(`${CHATWOOT_BASE_URL}/api/v1/accounts/${a}/conversations/${c}/messages`, form, { headers: { api_access_token: BOT_TOKEN, ...form.getHeaders() }, maxContentLength: Infinity, maxBodyLength: Infinity });
+  } catch (e) { console.error("sendMedia", e.response?.data || e.message); }
+}
+
 function toSession(row, fpa) { return { nodeId: row.node_id, awaiting: row.awaiting, variables: typeof row.variables === "string" ? JSON.parse(row.variables) : (row.variables || {}), flowPublishedAt: row.flow_published_at ? new Date(row.flow_published_at).toISOString() : fpa }; }
 async function runFlow(a, c, s, def) {
   for (let i = 0; i < 50; i++) {
     const node = def.nodes[s.nodeId];
     if (!node) { s.awaiting = null; s.nodeId = null; return; }
     if (node.type === "text") { await sendText(a, c, node.text); if (node.next) { s.nodeId = node.next; continue; } s.awaiting = null; s.nodeId = null; return; }
+    if (node.type === "media") { await sendMedia(a, c, node.url, node.caption); if (node.next) { s.nodeId = node.next; continue; } s.awaiting = null; s.nodeId = null; return; }
     if (node.type === "buttons") { await sendButtons(a, c, node.text, node.buttons); s.awaiting = "buttons"; return; }
     if (node.type === "question") { await sendText(a, c, node.text); s.awaiting = "question"; return; }
     if (node.type === "handover") { if (node.text) await sendText(a, c, node.text); await openConversation(a, c); s.awaiting = null; s.nodeId = null; return; }
