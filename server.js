@@ -1,9 +1,11 @@
 import express from "express";
 import axios from "axios";
 import fs from "fs";
+import os from "os";
 import path from "path";
 import multer from "multer";
 import FormData from "form-data";
+import { spawn } from "child_process";
 import {
   initDb, seedFlowIfEmpty, getPublishedFlowForInbox, getSession, saveSession,
   listFlows, createFlow, getFlowById, saveFlowById, publishFlowById, unpublishFlowById, deleteFlowById, assignInbox,
@@ -86,7 +88,7 @@ app.get("/api/inboxes", async (req, res) => {
   } catch (e) { console.error("GET /api/inboxes", e.response?.data || e.message); res.status(500).json({ error: e.message }); }
 });
 
-// labels list (for Update Tag node dropdown in the builder)
+// labels list (for the Update Tag node dropdown in the builder)
 app.get("/api/labels", async (req, res) => {
   try {
     const accountId = parseInt(req.query.account_id, 10);
@@ -117,18 +119,55 @@ async function addLabels(a, c, labels) {
 }
 
 function ctaText(node) {
-  let out = node.body || "";
+  let out = (node.header && node.header.type === "text" && node.header.value ? node.header.value + "\n\n" : "") + (node.body || "");
   if (node.url) out += (out ? "\n\n" : "") + (node.display ? node.display + ": " : "") + node.url;
   if (node.footer) out += "\n\n" + node.footer;
   return out;
 }
 
-function evalCondition(node, vars) {
+// ---- text helpers / matching ----
+const norm = (s) => String(s == null ? "" : s).toLowerCase().trim();
+const normLoose = (s) => norm(s).replace(/[^a-z0-9\u0600-\u06FF]+/g, "");
+function levenshtein(a, b) {
+  a = normLoose(a); b = normLoose(b);
+  if (a === b) return 0; if (!a.length) return b.length; if (!b.length) return a.length;
+  const v0 = new Array(b.length + 1), v1 = new Array(b.length + 1);
+  for (let i = 0; i <= b.length; i++) v0[i] = i;
+  for (let i = 0; i < a.length; i++) {
+    v1[0] = i + 1;
+    for (let j = 0; j < b.length; j++) { const cost = a[i] === b[j] ? 0 : 1; v1[j + 1] = Math.min(v1[j] + 1, v0[j + 1] + 1, v0[j] + cost); }
+    for (let j = 0; j <= b.length; j++) v0[j] = v1[j];
+  }
+  return v1[b.length];
+}
+function fuzzyEqual(a, b) {
+  const x = normLoose(a), y = normLoose(b);
+  if (!x || !y) return false;
+  if (x === y || x.includes(y) || y.includes(x)) return true;
+  const d = levenshtein(x, y); const m = Math.max(x.length, y.length);
+  return m > 0 && (1 - d / m) >= 0.8;
+}
+function matchKeywords(text, keywords, fuzzy) {
+  return (keywords || []).some((k) => fuzzy ? fuzzyEqual(text, k) : norm(text).includes(norm(k)));
+}
+function validateFormat(text, fmt) {
+  const t = String(text || "").trim();
+  switch (fmt) {
+    case "text": return t.length > 0;
+    case "number": return /^-?\d+(\.\d+)?$/.test(t);
+    case "email": return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(t);
+    case "phone": return /^[+]?[\d\s\-()]{7,}$/.test(t);
+    default: return true; // "any"
+  }
+}
+
+// ---- condition evaluation (single + multi with All/Any + Fuzzy) ----
+function evalSingle(cond, vars) {
   const subst = (str) => String(str == null ? "" : str).replace(/\{\{(\w+)\}\}/g, (_, k) => (vars[k] != null ? String(vars[k]) : ""));
-  let a = node.first ? subst(node.first) : (vars.last_message || "");
-  const b = subst(node.second);
-  const al = a.toLowerCase().trim(), bl = b.toLowerCase().trim();
-  switch (node.operator || "equals") {
+  let a = cond.first ? subst(cond.first) : (vars.last_message || "");
+  const b = subst(cond.second);
+  const al = norm(a), bl = norm(b);
+  switch (cond.operator || "equals") {
     case "equals": return al === bl;
     case "not_equals": return al !== bl;
     case "contains": return al.includes(bl);
@@ -140,16 +179,43 @@ function evalCondition(node, vars) {
     case "is_email": return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(a.trim());
     case "is_phone": return /^[+]?[\d\s\-()]{7,}$/.test(a.trim());
     case "regex": try { return new RegExp(b, "i").test(a); } catch { return false; }
+    case "fuzzy": return fuzzyEqual(a, b);
     default: return false;
   }
+}
+function evalConditionNode(node, vars) {
+  const list = Array.isArray(node.conditions) && node.conditions.length ? node.conditions : [{ first: node.first, operator: node.operator, second: node.second }];
+  return (node.match === "any") ? list.some((c) => evalSingle(c, vars)) : list.every((c) => evalSingle(c, vars));
 }
 
 // Map a file extension to a MIME type (Chatwoot needs the content type for attachments)
 function extToMime(name) {
   const ext = (String(name).split("?")[0].split(".").pop() || "").toLowerCase();
-  const map = { jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", gif: "image/gif", webp: "image/webp", bmp: "image/bmp", svg: "image/svg+xml", mp4: "video/mp4", webm: "video/webm", mov: "video/quicktime", mkv: "video/x-matroska", mp3: "audio/mpeg", ogg: "audio/ogg", wav: "audio/wav", m4a: "audio/mp4", aac: "audio/aac", pdf: "application/pdf" };
+  const map = { jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", gif: "image/gif", webp: "image/webp", bmp: "image/bmp", svg: "image/svg+xml", mp4: "video/mp4", webm: "video/webm", mov: "video/quicktime", mkv: "video/x-matroska", mp3: "audio/mpeg", ogg: "audio/ogg", oga: "audio/ogg", opus: "audio/ogg", wav: "audio/wav", m4a: "audio/mp4", aac: "audio/aac", amr: "audio/amr", flac: "audio/flac", weba: "audio/webm", pdf: "application/pdf" };
   return map[ext] || "application/octet-stream";
 }
+const AUDIO_EXT = ["ogg", "oga", "opus", "wav", "m4a", "aac", "amr", "flac", "weba", "mka"];
+function runFfmpeg(args) { return new Promise((res) => { try { const p = spawn("ffmpeg", args, { stdio: "ignore" }); p.on("close", (code) => res(code)); p.on("error", () => res(-1)); } catch { res(-1); } }); }
+// WhatsApp Cloud rejects most .ogg/.wav audio (needs OGG-OPUS / mp3 / m4a / aac). Auto-convert any audio to MP3 before sending.
+async function maybeTranscodeAudio(buffer, baseName) {
+  const ext = (String(baseName).split(".").pop() || "").toLowerCase();
+  if (!AUDIO_EXT.includes(ext)) return { buffer, filename: baseName, contentType: extToMime(baseName) };
+  try {
+    const tmpIn = path.join(os.tmpdir(), "csin_" + Date.now() + "_" + Math.random().toString(36).slice(2, 6) + "." + ext);
+    const tmpOut = path.join(os.tmpdir(), "csout_" + Date.now() + "_" + Math.random().toString(36).slice(2, 6) + ".mp3");
+    fs.writeFileSync(tmpIn, buffer);
+    const code = await runFfmpeg(["-y", "-i", tmpIn, "-vn", "-ar", "44100", "-ac", "2", "-b:a", "128k", tmpOut]);
+    if (code === 0 && fs.existsSync(tmpOut)) {
+      const out = fs.readFileSync(tmpOut);
+      try { fs.unlinkSync(tmpIn); } catch {} try { fs.unlinkSync(tmpOut); } catch {}
+      return { buffer: out, filename: String(baseName).replace(/\.[^.]+$/, "") + ".mp3", contentType: "audio/mpeg" };
+    }
+    try { fs.unlinkSync(tmpIn); } catch {}
+    console.error("transcode: ffmpeg failed (code " + code + ") for " + baseName + " — sending original");
+  } catch (e) { console.error("transcode", e.message); }
+  return { buffer, filename: baseName, contentType: extToMime(baseName) };
+}
+
 // Send a media file to Chatwoot as a real attachment (multipart/form-data, attachments[])
 async function sendMedia(a, c, url, caption) {
   try {
@@ -164,15 +230,21 @@ async function sendMedia(a, c, url, caption) {
       const resp = await axios.get(url, { responseType: "arraybuffer", maxContentLength: Infinity, maxBodyLength: Infinity }); // external / pasted link
       buffer = Buffer.from(resp.data);
     }
+    const tx = await maybeTranscodeAudio(buffer, path.basename(baseName)); // auto -> mp3 for audio
     const form = new FormData();
     if (caption) form.append("content", caption);
     form.append("message_type", "outgoing");
-    form.append("attachments[]", buffer, { filename: path.basename(baseName), contentType: extToMime(baseName) });
+    form.append("attachments[]", tx.buffer, { filename: tx.filename, contentType: tx.contentType });
     await axios.post(`${CHATWOOT_BASE_URL}/api/v1/accounts/${a}/conversations/${c}/messages`, form, { headers: { api_access_token: BOT_TOKEN, ...form.getHeaders() }, maxContentLength: Infinity, maxBodyLength: Infinity });
   } catch (e) { console.error("sendMedia", e.response?.data || e.message); }
 }
 
 function toSession(row, fpa) { return { nodeId: row.node_id, awaiting: row.awaiting, variables: typeof row.variables === "string" ? JSON.parse(row.variables) : (row.variables || {}), flowPublishedAt: row.flow_published_at ? new Date(row.flow_published_at).toISOString() : fpa }; }
+
+// rows of a list node (supports new sections[] or flat rows[])
+function listRows(node) { return Array.isArray(node.sections) && node.sections.length ? node.sections.flatMap((s) => s.rows || []) : (node.rows || []); }
+async function sendHeaderMedia(a, c, node) { const h = node.header || {}; if (["image", "video", "document"].includes(h.type) && h.value) await sendMedia(a, c, h.value, ""); }
+function withHeaderFooter(node, body) { let out = (node.header && node.header.type === "text" && node.header.value ? node.header.value + "\n\n" : "") + (body || ""); if (node.footer) out += "\n\n" + node.footer; return out; }
 
 async function runFlow(a, c, s, def) {
   for (let i = 0; i < 100; i++) {
@@ -183,19 +255,19 @@ async function runFlow(a, c, s, def) {
 
     if (node.type === "media") { await sendMedia(a, c, node.url, node.caption); s.nodeId = node.next || null; if (s.nodeId) continue; s.awaiting = null; return; }
 
-    if (node.type === "cta") { await sendText(a, c, ctaText(node)); s.nodeId = node.next || null; if (s.nodeId) continue; s.awaiting = null; return; }
+    if (node.type === "cta") { await sendHeaderMedia(a, c, node); await sendText(a, c, ctaText(node)); s.nodeId = node.next || null; if (s.nodeId) continue; s.awaiting = null; return; }
 
     if (node.type === "tag") { await addLabels(a, c, node.labels || []); s.nodeId = node.next || null; if (s.nodeId) continue; s.awaiting = null; return; }
 
     if (node.type === "delay") { const secs = Math.max(0, Math.min(parseInt(node.seconds, 10) || 0, 300)); if (secs > 0) await sleep(secs * 1000); s.nodeId = node.next || null; if (s.nodeId) continue; s.awaiting = null; return; }
 
-    if (node.type === "condition") { const ok = evalCondition(node, s.variables || {}); s.nodeId = ok ? (node.next_true || null) : (node.next_false || null); if (s.nodeId) continue; s.awaiting = null; return; }
+    if (node.type === "condition") { const ok = evalConditionNode(node, s.variables || {}); s.nodeId = ok ? (node.next_true || null) : (node.next_false || null); if (s.nodeId) continue; s.awaiting = null; return; }
 
-    if (node.type === "buttons") { await sendOptions(a, c, node.text, (node.buttons || []).map((b) => b.title)); s.awaiting = "buttons"; return; }
+    if (node.type === "buttons") { await sendHeaderMedia(a, c, node); await sendOptions(a, c, withHeaderFooter(node, node.text), (node.buttons || []).map((b) => b.title)); s.awaiting = "buttons"; return; }
 
-    if (node.type === "list") { await sendOptions(a, c, node.body, (node.rows || []).map((r) => r.title)); s.awaiting = "list"; return; }
+    if (node.type === "list") { await sendHeaderMedia(a, c, node); await sendOptions(a, c, withHeaderFooter(node, node.body), listRows(node).map((r) => r.title)); s.awaiting = "list"; return; }
 
-    if (node.type === "question") { await sendText(a, c, node.text); s.awaiting = "question"; return; }
+    if (node.type === "question") { await sendText(a, c, node.text); s.awaiting = "question"; s.variables.__q_token = Math.random().toString(36).slice(2); return; }
 
     if (node.type === "handover") { if (node.text) await sendText(a, c, node.text); await openConversation(a, c); s.awaiting = null; s.nodeId = null; return; }
 
@@ -203,12 +275,36 @@ async function runFlow(a, c, s, def) {
   }
 }
 
+// runFlow + persist + (re)schedule question timeout
+async function advance(a, c, s, def) { await runFlow(a, c, s, def); await saveSession(a, c, s); scheduleQuestionTimeout(a, c, s, def); }
+
+function scheduleQuestionTimeout(a, c, s, def) {
+  if (s.awaiting !== "question") return;
+  const node = def.nodes[s.nodeId];
+  if (!node || !node.timeout_seconds) return;
+  const token = s.variables.__q_token;
+  const ms = Math.max(1, Math.min(parseInt(node.timeout_seconds, 10) || 0, 3600)) * 1000;
+  setTimeout(async () => {
+    try {
+      const cur = await getSession(a, c);
+      if (!cur || cur.awaiting !== "question") return;
+      const vars = typeof cur.variables === "string" ? JSON.parse(cur.variables) : (cur.variables || {});
+      if (vars.__q_token !== token) return; // user replied, or a newer question replaced it
+      const ns = toSession(cur, s.flowPublishedAt);
+      if (node.timeout_message) await sendText(a, c, node.timeout_message);
+      if (node.continue_on_timeout) { ns.awaiting = null; ns.nodeId = node.next || null; await runFlow(a, c, ns, def); }
+      else { ns.awaiting = null; ns.nodeId = null; }
+      await saveSession(a, c, ns);
+    } catch (e) { console.error("qtimeout", e.message); }
+  }, ms);
+}
+
 // find which "next" an incoming reply (button/list selection) maps to
 function matchChoice(node, choice) {
-  const t = (choice || "").toLowerCase().trim();
+  const t = norm(choice);
   if (!node) return null;
-  if (node.type === "buttons") { const b = (node.buttons || []).find((x) => (x.title || "").toLowerCase().trim() === t); return b ? (b.next || null) : null; }
-  if (node.type === "list") { const r = (node.rows || []).find((x) => (x.title || "").toLowerCase().trim() === t); return r ? (r.next || null) : null; }
+  if (node.type === "buttons") { const b = (node.buttons || []).find((x) => norm(x.title) === t); return b ? (b.next || null) : null; }
+  if (node.type === "list") { const r = listRows(node).find((x) => norm(x.title) === t); return r ? (r.next || null) : null; }
   return null;
 }
 
@@ -231,13 +327,10 @@ app.post("/webhook", async (req, res) => {
       const choice = (submitted[0].value || submitted[0].title || "").trim();
       if (session && (session.awaiting === "buttons" || session.awaiting === "list") && session.node_id) {
         const next = matchChoice(def.nodes[session.node_id], choice);
-        if (next !== null || true) {
-          const s = toSession(session, flowPublishedAt);
-          s.variables.last_message = choice;
-          s.nodeId = next; s.awaiting = null;
-          await runFlow(accountId, conversationId, s, def);
-          await saveSession(accountId, conversationId, s);
-        }
+        const s = toSession(session, flowPublishedAt);
+        s.variables.last_message = choice;
+        s.nodeId = next; s.awaiting = null;
+        await advance(accountId, conversationId, s, def);
       }
       return;
     }
@@ -248,12 +341,13 @@ app.post("/webhook", async (req, res) => {
 
     const isRepublished = session && session.flow_published_at && new Date(session.flow_published_at).getTime() < new Date(flowPublishedAt).getTime();
 
-    // No session yet, or flow was re-published -> (re)start the flow
+    // No session yet, or flow was re-published -> (re)start the flow (optionally gated by On Message keywords)
     if (!session || isRepublished) {
+      const trig = def.trigger || {};
+      if (trig.keywords && trig.keywords.length && !matchKeywords(text, trig.keywords, trig.fuzzy)) return; // keyword set but not matched -> don't start
       await openConversation(accountId, conversationId);
       const s = { nodeId: def.start, awaiting: null, variables: { last_message: text }, flowPublishedAt };
-      await runFlow(accountId, conversationId, s, def);
-      await saveSession(accountId, conversationId, s);
+      await advance(accountId, conversationId, s, def);
       return;
     }
 
@@ -262,7 +356,7 @@ app.post("/webhook", async (req, res) => {
       const next = matchChoice(def.nodes[session.node_id], text);
       const s = toSession(session, flowPublishedAt);
       s.variables.last_message = text;
-      if (next !== null) { s.nodeId = next; s.awaiting = null; await runFlow(accountId, conversationId, s, def); await saveSession(accountId, conversationId, s); }
+      if (next !== null) { s.nodeId = next; s.awaiting = null; await advance(accountId, conversationId, s, def); }
       else { await saveSession(accountId, conversationId, s); } // no match -> stay, keep last_message
       return;
     }
@@ -271,10 +365,14 @@ app.post("/webhook", async (req, res) => {
       const node = def.nodes[session.node_id];
       const s = toSession(session, flowPublishedAt);
       s.variables.last_message = text;
+      if (node && node.response_format && !validateFormat(text, node.response_format)) {
+        await sendText(accountId, conversationId, node.text); // invalid format -> re-ask, stay awaiting
+        await saveSession(accountId, conversationId, s);
+        return;
+      }
       if (node?.save_as) s.variables[node.save_as] = text;
       s.awaiting = null; s.nodeId = node?.next || null;
-      await runFlow(accountId, conversationId, s, def);
-      await saveSession(accountId, conversationId, s);
+      await advance(accountId, conversationId, s, def);
       return;
     }
 
