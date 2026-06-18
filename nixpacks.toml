@@ -1,0 +1,4 @@
+# Adds ffmpeg to the chatssync-bot container so audio (voice notes) can be
+# auto-converted to MP3 before being sent to WhatsApp.
+[phases.setup]
+aptPkgs = ["ffmpeg"]
