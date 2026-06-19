@@ -136,10 +136,12 @@ async function addLabels(a, c, labels) {
   } catch (e) { console.error("addLabels", e.response?.data || e.message); }
 }
 
+function normUrl(u) { u = String(u || "").trim(); if (!u) return ""; if (!/^https?:\/\//i.test(u)) u = "https://" + u.replace(/^\/+/, ""); return u; }
 function ctaText(node) {
   let out = (node.header && node.header.type === "text" && node.header.value ? node.header.value + "\n\n" : "") + (node.body || "");
-  if (node.url) out += (out ? "\n\n" : "") + (node.display ? node.display + ": " : "") + node.url;
-  if (node.footer) out += "\n\n" + node.footer;
+  const u = normUrl(node.url);
+  if (u) out += (out ? "\n\n" : "") + (node.display ? node.display + ": " : "") + u;
+  if (node.footer) out += "\n\n_" + node.footer + "_";
   return out;
 }
 
@@ -165,7 +167,12 @@ function fuzzyEqual(a, b) {
   const d = levenshtein(x, y); const m = Math.max(x.length, y.length);
   return m > 0 && (1 - d / m) >= 0.8;
 }
-function matchKeywords(text, keywords, fuzzy) { return (keywords || []).some((k) => fuzzy ? fuzzyEqual(text, k) : norm(text).includes(norm(k))); }
+function simRatio(a, b) { const x = normLoose(a), y = normLoose(b); if (!x || !y) return 0; if (x === y) return 1; const d = levenshtein(x, y); const m = Math.max(x.length, y.length); return m ? 1 - d / m : 0; }
+function fuzzyKeyword(text, k, threshold) { if (simRatio(text, k) >= threshold) return true; return norm(text).split(/\s+/).filter(Boolean).some((w) => simRatio(w, k) >= threshold); }
+function matchKeywords(text, keywords, fuzzy, sensitivity) {
+  const th = Math.min(Math.max((parseInt(sensitivity, 10) || 80) / 100, 0.3), 1);
+  return (keywords || []).some((k) => fuzzy ? fuzzyKeyword(text, k, th) : norm(text) === norm(k));
+}
 function validateFormat(text, fmt) {
   const t = String(text || "").trim();
   switch (fmt) {
@@ -260,7 +267,7 @@ function toSession(row, fpa) { return { nodeId: row.node_id, awaiting: row.await
 // rows of a list node (supports new sections[] or flat rows[])
 function listRows(node) { return Array.isArray(node.sections) && node.sections.length ? node.sections.flatMap((s) => s.rows || []) : (node.rows || []); }
 async function sendHeaderMedia(a, c, node) { const h = node.header || {}; if (["image", "video", "document"].includes(h.type) && h.value) await sendMedia(a, c, h.value, ""); }
-function withHeaderFooter(node, body) { let out = (node.header && node.header.type === "text" && node.header.value ? node.header.value + "\n\n" : "") + (body || ""); if (node.footer) out += "\n\n" + node.footer; return out; }
+function withHeaderFooter(node, body) { let out = (node.header && node.header.type === "text" && node.header.value ? node.header.value + "\n\n" : "") + (body || ""); if (node.footer) out += "\n\n_" + node.footer + "_"; return out; }
 
 async function runFlow(a, c, s, def) {
   for (let i = 0; i < 100; i++) {
@@ -358,7 +365,7 @@ app.post("/webhook", async (req, res) => {
     // No session yet, or flow was re-published -> (re)start the flow (optionally gated by On Message keywords)
     if (!session || isRepublished) {
       const trig = def.trigger || {};
-      if (trig.keywords && trig.keywords.length && !matchKeywords(text, trig.keywords, trig.fuzzy)) return; // keyword set but not matched -> don't start
+      if (trig.keywords && trig.keywords.length && !matchKeywords(text, trig.keywords, trig.fuzzy, trig.sensitivity)) return; // keyword set but not matched -> don't start
       openConversation(accountId, conversationId); // fire-and-forget (don't delay the reply)
       const s = { nodeId: def.start, awaiting: null, variables: { last_message: text }, flowPublishedAt };
       await advance(accountId, conversationId, s, def);
