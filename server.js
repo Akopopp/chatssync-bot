@@ -171,7 +171,7 @@ function simRatio(a, b) { const x = normLoose(a), y = normLoose(b); if (!x || !y
 function fuzzyKeyword(text, k, threshold) { if (simRatio(text, k) >= threshold) return true; return norm(text).split(/\s+/).filter(Boolean).some((w) => simRatio(w, k) >= threshold); }
 function matchKeywords(text, keywords, fuzzy, sensitivity) {
   const th = Math.min(Math.max((parseInt(sensitivity, 10) || 80) / 100, 0.3), 1);
-  return (keywords || []).some((k) => fuzzy ? fuzzyKeyword(text, k, th) : norm(text) === norm(k));
+  return (keywords || []).some((k) => fuzzy ? fuzzyKeyword(text, k, th) : normLoose(text) === normLoose(k));
 }
 function validateFormat(text, fmt) {
   const t = String(text || "").trim();
@@ -288,7 +288,14 @@ async function runFlow(a, c, s, def) {
 
     if (node.type === "buttons") { await sendHeaderMedia(a, c, node); await sendOptions(a, c, withHeaderFooter(node, node.text), (node.buttons || []).map((b) => b.title)); s.awaiting = "buttons"; s.variables.__opts = s.nodeId; return; }
 
-    if (node.type === "list") { await sendHeaderMedia(a, c, node); await sendOptions(a, c, withHeaderFooter(node, node.body), listRows(node).map((r) => r.title)); s.awaiting = "list"; s.variables.__opts = s.nodeId; return; }
+    if (node.type === "list") {
+      await sendHeaderMedia(a, c, node);
+      const rows = listRows(node);
+      let lbody = node.body || "";
+      if (rows.some((r) => r.description)) lbody += "\n\n" + rows.map((r) => r.description ? `▸ ${r.title} — ${r.description}` : `▸ ${r.title}`).join("\n");
+      await sendOptions(a, c, withHeaderFooter(node, lbody), rows.map((r) => r.title));
+      s.awaiting = "list"; s.variables.__opts = s.nodeId; return;
+    }
 
     if (node.type === "question") { await sendText(a, c, node.text); s.awaiting = "question"; s.variables.__q_token = Math.random().toString(36).slice(2); return; }
 
