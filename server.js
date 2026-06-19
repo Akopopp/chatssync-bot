@@ -297,6 +297,13 @@ async function runFlow(a, c, s, def) {
       s.awaiting = "list"; s.variables.__opts = s.nodeId; return;
     }
 
+    if (node.type === "form") {
+      if (node.intro) await sendText(a, c, node.intro);
+      const ff = (node.fields || []).filter((fd) => (fd.label || "").trim());
+      if (!ff.length) { s.nodeId = node.next || null; if (s.nodeId) continue; s.awaiting = null; return; }
+      s.awaiting = "form"; s.variables.__form_idx = 0; s.variables.__form_answers = {};
+      await sendText(a, c, ff[0].label); return;
+    }
     if (node.type === "question") { await sendText(a, c, node.text); s.awaiting = "question"; s.variables.__q_token = Math.random().toString(36).slice(2); return; }
 
     if (node.type === "handover") { if (node.text) await sendText(a, c, node.text); openConversation(a, c); s.awaiting = null; s.nodeId = null; return; }
@@ -399,6 +406,24 @@ app.post("/webhook", async (req, res) => {
       }
       if (node?.save_as) s.variables[node.save_as] = text;
       s.awaiting = null; s.nodeId = node?.next || null;
+      await advance(accountId, conversationId, s, def);
+      return;
+    }
+
+    if (session.awaiting === "form") {
+      const fnode = def.nodes[session.node_id];
+      const ff = ((fnode && fnode.fields) || []).filter((fd) => (fd.label || "").trim());
+      let fidx = s.variables.__form_idx || 0;
+      const fans = s.variables.__form_answers || {};
+      const cur = ff[fidx];
+      if (cur) { const k = cur.key || ("field_" + (fidx + 1)); fans[k] = text; s.variables[k] = text; }
+      fidx++; s.variables.__form_answers = fans; s.variables.__form_idx = fidx;
+      if (fidx < ff.length) { await sendText(accountId, conversationId, ff[fidx].label); await saveSession(accountId, conversationId, s); return; }
+      const summary = "📋 *Form submitted:*\n" + ff.map((fd, i) => `• ${fd.key || ("field_" + (i + 1))}: ${fans[fd.key || ("field_" + (i + 1))] || "-"}`).join("\n");
+      await sendText(accountId, conversationId, summary);
+      if (fnode && fnode.submit_message) await sendText(accountId, conversationId, fnode.submit_message);
+      delete s.variables.__form_idx; delete s.variables.__form_answers;
+      s.awaiting = null; s.nodeId = (fnode && fnode.next) || null;
       await advance(accountId, conversationId, s, def);
       return;
     }
