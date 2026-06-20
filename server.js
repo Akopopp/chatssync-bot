@@ -129,11 +129,26 @@ function openConversation(a, c) { apiPost(`/api/v1/accounts/${a}/conversations/$
 async function addLabels(a, c, labels) {
   try {
     if (!labels || !labels.length) return;
+    const H = { headers: { api_access_token: ADMIN_TOKEN } };
+    // 1) make sure each label exists as an account label (create the missing ones)
+    try {
+      const al = await cw.get(`${CHATWOOT_BASE_URL}/api/v1/accounts/${a}/labels`, H);
+      const existing = (al.data?.payload || []).map((l) => (l.title || "").toLowerCase());
+      for (const t of labels) {
+        if (!existing.includes(String(t).toLowerCase())) {
+          try { await cw.post(`${CHATWOOT_BASE_URL}/api/v1/accounts/${a}/labels`, { title: String(t).toLowerCase().replace(/\s+/g, "_"), color: "#1f93ff", show_on_sidebar: true }, H); }
+          catch (ce) { console.error("createLabel FAIL", t, ce.response?.status, ce.response?.data || ce.message); }
+        }
+      }
+    } catch (le) { console.error("listLabels FAIL", le.response?.status, le.response?.data || le.message); }
+    // 2) merge with the conversation's current labels and apply
     let cur = [];
-    try { const r = await cw.get(`${CHATWOOT_BASE_URL}/api/v1/accounts/${a}/conversations/${c}/labels`, { headers: { api_access_token: ADMIN_TOKEN } }); cur = r.data?.payload || []; } catch {}
-    const merged = [...new Set([...cur, ...labels])];
-    await cw.post(`${CHATWOOT_BASE_URL}/api/v1/accounts/${a}/conversations/${c}/labels`, { labels: merged }, { headers: { api_access_token: ADMIN_TOKEN } });
-  } catch (e) { console.error("addLabels", e.response?.data || e.message); }
+    try { const r = await cw.get(`${CHATWOOT_BASE_URL}/api/v1/accounts/${a}/conversations/${c}/labels`, H); cur = r.data?.payload || []; } catch {}
+    const norm = labels.map((t) => String(t).toLowerCase().replace(/\s+/g, "_"));
+    const merged = [...new Set([...cur, ...norm])];
+    const resp = await cw.post(`${CHATWOOT_BASE_URL}/api/v1/accounts/${a}/conversations/${c}/labels`, { labels: merged }, H);
+    console.log("addLabels OK", c, JSON.stringify(merged), resp.status);
+  } catch (e) { console.error("addLabels FAIL", e.response?.status, e.response?.data || e.message); }
 }
 
 function normUrl(u) { u = String(u || "").trim(); if (!u) return ""; if (!/^https?:\/\//i.test(u)) u = "https://" + u.replace(/^\/+/, ""); return u; }
