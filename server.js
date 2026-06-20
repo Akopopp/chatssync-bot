@@ -26,7 +26,19 @@ const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || "").replace(/\/$/, "");
 const WA_TOKEN = process.env.WA_TOKEN || "";
 const WA_PHONE_ID = process.env.WA_PHONE_NUMBER_ID || "";
 const WA_VER = process.env.WA_GRAPH_VERSION || "v21.0";
+const WA_ACCOUNT_ID = process.env.WA_ACCOUNT_ID || ""; // native only for this account (multi-account safety)
 const waEnabled = !!(WA_TOKEN && WA_PHONE_ID);
+// Optional: Chatwoot DB (read-only) -> auto-fetch each account's WhatsApp creds for native (true multi-account, no per-number env)
+const CHATWOOT_DB_URL = process.env.CHATWOOT_DB_URL || "";
+let chatwootDb = null, chatwootDbTried = false;
+async function getChatwootDb() {
+  if (chatwootDb || chatwootDbTried) return chatwootDb;
+  chatwootDbTried = true;
+  if (!CHATWOOT_DB_URL) return null;
+  try { const pg = (await import("pg")).default; chatwootDb = new pg.Pool({ connectionString: CHATWOOT_DB_URL, max: 3 }); chatwootDb.on("error", (e) => console.error("chatwootDb pool", e.message)); console.log("chatwootDb: connected"); }
+  catch (e) { console.error("chatwootDb init FAIL", e.message); chatwootDb = null; }
+  return chatwootDb;
+}
 
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
@@ -131,17 +143,48 @@ async function sendText(a, c, text) { if (!text) return; try { await apiPost(`/a
 async function sendOptions(a, c, text, titles) { try { await apiPost(`/api/v1/accounts/${a}/conversations/${c}/messages`, { content: text || " ", message_type: "outgoing", content_type: "input_select", content_attributes: { items: (titles || []).map((t) => ({ title: t, value: t })) } }); } catch (e) { console.error("sendOptions", e.response?.data || e.message); } }
 
 // ===== Native WhatsApp Cloud interactive (real CTA button / list descriptions / footer) =====
-const senderCache = new Map();
-async function getSenderNumber(a, c) {
-  const hit = senderCache.get(c); if (hit && hit.exp > Date.now()) return hit.number;
+const convCache = new Map();
+async function getConvInfo(a, c) {
+  const hit = convCache.get(c); if (hit && hit.exp > Date.now()) return hit.info;
+  let info = { number: null, inboxId: null };
   try {
     const r = await cw.get(`${CHATWOOT_BASE_URL}/api/v1/accounts/${a}/conversations/${c}`, { headers: { api_access_token: ADMIN_TOKEN } });
-    const meta = r.data?.meta || {};
+    const d = r.data || {}; const meta = d.meta || {};
     let num = (meta.sender && (meta.sender.phone_number || meta.sender.identifier)) || "";
-    num = String(num).replace(/[^\d]/g, "");
-    if (num) senderCache.set(c, { number: num, exp: Date.now() + 600000 });
-    return num || null;
-  } catch (e) { console.error("getSenderNumber FAIL", e.response?.status, e.message); return null; }
+    info = { number: String(num).replace(/[^\d]/g, "") || null, inboxId: d.inbox_id ?? meta.inbox_id ?? null };
+  } catch (e) { console.error("getConvInfo FAIL", e.response?.status, e.message); }
+  convCache.set(c, { info, exp: Date.now() + 600000 });
+  console.log("getConvInfo", c, "->", JSON.stringify(info));
+  return info;
+}
+const credsCache = new Map();
+async function getWaCreds(a, inboxId) {
+  if (!inboxId) return null;
+  const key = `${a}:${inboxId}`;
+  const hit = credsCache.get(key); if (hit && hit.exp > Date.now()) return hit.creds;
+  let creds = null;
+  // 1) Chatwoot API (inbox provider_config) — works if Chatwoot returns the token
+  try {
+    const r = await cw.get(`${CHATWOOT_BASE_URL}/api/v1/accounts/${a}/inboxes/${inboxId}`, { headers: { api_access_token: ADMIN_TOKEN } });
+    const d = r.data || {}; const pc = d.provider_config || (d.channel && d.channel.provider_config) || {};
+    const token = pc.api_key || pc.access_token; const phoneId = pc.phone_number_id;
+    if (token && phoneId) creds = { token, phoneId, src: "api" };
+  } catch (e) {}
+  // 2) Chatwoot DB (reliable) — if CHATWOOT_DB_URL is set
+  const db = await getChatwootDb();
+  if (!creds && db) {
+    try {
+      const q = await db.query("SELECT cw.provider_config AS pc FROM channel_whatsapp cw JOIN inboxes i ON i.channel_id = cw.id WHERE i.id = $1 AND i.channel_type = 'Channel::Whatsapp' LIMIT 1", [inboxId]);
+      const pc = (q.rows[0] && q.rows[0].pc) || {};
+      const token = pc.api_key || pc.access_token; const phoneId = pc.phone_number_id;
+      if (token && phoneId) creds = { token, phoneId, src: "db" };
+    } catch (e) { console.error("waCreds DB FAIL", e.message); }
+  }
+  // 3) env fallback (single account, gated by WA_ACCOUNT_ID)
+  if (!creds && WA_TOKEN && WA_PHONE_ID && (!WA_ACCOUNT_ID || String(a) === String(WA_ACCOUNT_ID))) creds = { token: WA_TOKEN, phoneId: WA_PHONE_ID, src: "env" };
+  credsCache.set(key, { creds, exp: Date.now() + (creds ? 600000 : 120000) });
+  console.log("getWaCreds", key, creds ? ("OK via " + creds.src) : "none");
+  return creds;
 }
 function clip(x, n) { return x == null ? "" : String(x).slice(0, n); }
 function waHeader(node, textOnly) {
@@ -150,33 +193,34 @@ function waHeader(node, textOnly) {
   if (!textOnly && ["image", "video", "document"].includes(h.type) && h.value) { const k = h.type; return { type: k, [k]: { link: h.value } }; }
   return null;
 }
-async function waSend(to, interactive) {
-  const r = await cw.post(`https://graph.facebook.com/${WA_VER}/${WA_PHONE_ID}/messages`,
+async function waSend(creds, to, interactive) {
+  const r = await cw.post(`https://graph.facebook.com/${WA_VER}/${creds.phoneId}/messages`,
     { messaging_product: "whatsapp", recipient_type: "individual", to, type: "interactive", interactive },
-    { headers: { Authorization: `Bearer ${WA_TOKEN}`, "Content-Type": "application/json" }, timeout: 15000 });
+    { headers: { Authorization: `Bearer ${creds.token}`, "Content-Type": "application/json" }, timeout: 15000 });
+  console.log("waSend OK", interactive.type, "->", to, JSON.stringify(r.data?.messages || r.data));
   return r.data;
 }
 async function noteSent(a, c, body, options) {
   try { let txt = "🤖 " + (body || "(interactive sent)"); if (options && options.length) txt += "\n• " + options.filter(Boolean).join("\n• "); await apiPost(`/api/v1/accounts/${a}/conversations/${c}/messages`, { content: txt, message_type: "outgoing", private: true }); } catch (e) {}
 }
 async function trySendButtonsNative(a, c, node) {
-  if (!waEnabled) return false;
   try {
-    const to = await getSenderNumber(a, c); if (!to) return false;
+    const info = await getConvInfo(a, c); if (!info.number || !info.inboxId) return false;
+    const creds = await getWaCreds(a, info.inboxId); if (!creds) return false;
     const btns = (node.buttons || []).slice(0, 3).map((b, i) => ({ type: "reply", reply: { id: `b${i}`, title: clip(b.title || `Button ${i + 1}`, 20) } }));
     if (!btns.length) return false;
     const interactive = { type: "button", body: { text: clip(node.text || "Choose an option", 1024) }, action: { buttons: btns } };
     const hdr = waHeader(node, false); if (hdr) interactive.header = hdr;
     if (node.footer) interactive.footer = { text: clip(node.footer, 60) };
-    await waSend(to, interactive);
+    await waSend(creds, info.number, interactive);
     await noteSent(a, c, node.text, btns.map((b) => b.reply.title));
     return true;
   } catch (e) { console.error("buttonsNative FAIL", e.response?.status, JSON.stringify(e.response?.data || e.message)); return false; }
 }
 async function trySendListNative(a, c, node) {
-  if (!waEnabled) return false;
   try {
-    const to = await getSenderNumber(a, c); if (!to) return false;
+    const info = await getConvInfo(a, c); if (!info.number || !info.inboxId) return false;
+    const creds = await getWaCreds(a, info.inboxId); if (!creds) return false;
     const h = node.header || {};
     if (["image", "video", "document"].includes(h.type) && h.value) { try { await sendMedia(a, c, h.value, ""); } catch (e) {} }
     const srcSecs = (Array.isArray(node.sections) && node.sections.length) ? node.sections : [{ title: "", rows: node.rows || [] }];
@@ -191,20 +235,20 @@ async function trySendListNative(a, c, node) {
     const interactive = { type: "list", body: { text: clip(node.body || "Choose an option", 1024) }, action: { button: clip(node.button || "Menu", 20), sections } };
     const hdr = waHeader(node, true); if (hdr) interactive.header = hdr;
     if (node.footer) interactive.footer = { text: clip(node.footer, 60) };
-    await waSend(to, interactive);
+    await waSend(creds, info.number, interactive);
     await noteSent(a, c, node.body, listRows(node).map((r) => r.title));
     return true;
   } catch (e) { console.error("listNative FAIL", e.response?.status, JSON.stringify(e.response?.data || e.message)); return false; }
 }
 async function trySendCtaNative(a, c, node) {
-  if (!waEnabled) return false;
   try {
-    const to = await getSenderNumber(a, c); if (!to) return false;
+    const info = await getConvInfo(a, c); if (!info.number || !info.inboxId) return false;
+    const creds = await getWaCreds(a, info.inboxId); if (!creds) return false;
     const url = normUrl(node.url); if (!url) return false;
     const interactive = { type: "cta_url", body: { text: clip(node.body || "Tap the button below", 1024) }, action: { name: "cta_url", parameters: { display_text: clip(node.display || "Open link", 20), url } } };
     const hdr = waHeader(node, false); if (hdr) interactive.header = hdr;
     if (node.footer) interactive.footer = { text: clip(node.footer, 60) };
-    await waSend(to, interactive);
+    await waSend(creds, info.number, interactive);
     await noteSent(a, c, (node.body || "") + "\n🔗 " + url, null);
     return true;
   } catch (e) { console.error("ctaNative FAIL", e.response?.status, JSON.stringify(e.response?.data || e.message)); return false; }
@@ -388,7 +432,7 @@ async function runFlow(a, c, s, def) {
 
     if (node.type === "condition") { const ok = evalConditionNode(node, s.variables || {}); s.nodeId = ok ? (node.next_true || null) : (node.next_false || null); if (s.nodeId) continue; s.awaiting = null; return; }
 
-    if (node.type === "buttons") { const okb = await trySendButtonsNative(a, c, node); if (!okb) { await sendHeaderMedia(a, c, node); await sendOptions(a, c, withHeaderFooter(node, node.text), (node.buttons || []).map((b) => b.title)); } s.awaiting = "buttons"; s.variables.__opts = s.nodeId; return; }
+    if (node.type === "buttons") { await sendHeaderMedia(a, c, node); await sendOptions(a, c, withHeaderFooter(node, node.text), (node.buttons || []).map((b) => b.title)); s.awaiting = "buttons"; s.variables.__opts = s.nodeId; return; }
 
     if (node.type === "list") {
       const okl = await trySendListNative(a, c, node);
