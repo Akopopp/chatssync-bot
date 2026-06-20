@@ -137,7 +137,17 @@ app.get("/api/labels", async (req, res) => {
 
 // ===================== BOT ENGINE =====================
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-async function apiPost(path2, body) { return cw.post(`${CHATWOOT_BASE_URL}${path2}`, body, { headers: { api_access_token: BOT_TOKEN } }); }
+async function apiPost(path2, body) {
+  try { return await cw.post(`${CHATWOOT_BASE_URL}${path2}`, body, { headers: { api_access_token: BOT_TOKEN } }); }
+  catch (e) {
+    const st = e.response?.status;
+    if ((st === 401 || st === 403) && ADMIN_TOKEN && ADMIN_TOKEN !== BOT_TOKEN) {
+      console.log("apiPost: bot token rejected (" + st + ") on " + path2 + " — retrying with admin token");
+      return cw.post(`${CHATWOOT_BASE_URL}${path2}`, body, { headers: { api_access_token: ADMIN_TOKEN } });
+    }
+    throw e;
+  }
+}
 async function sendText(a, c, text) { if (!text) return; try { await apiPost(`/api/v1/accounts/${a}/conversations/${c}/messages`, { content: text, message_type: "outgoing" }); } catch (e) { console.error("sendText", e.response?.data || e.message); } }
 // Chatwoot turns input_select into WhatsApp interactive buttons (<=3 items) or a list (>3 items)
 async function sendOptions(a, c, text, titles) { try { await apiPost(`/api/v1/accounts/${a}/conversations/${c}/messages`, { content: text || " ", message_type: "outgoing", content_type: "input_select", content_attributes: { items: (titles || []).map((t) => ({ title: t, value: t })) } }); } catch (e) { console.error("sendOptions", e.response?.data || e.message); } }
