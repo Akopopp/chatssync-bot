@@ -4,7 +4,8 @@
   "description": "ChatsSync chatbot engine",
   "main": "server.js",
   "type": "module",
-  "scripts": { "start": "node server.js" },"googleapis": "^144.0.0",
+  "scripts": { "start": "node server.js" },
+  "googleapis": "^144.0.0",
   "engines": { "node": "20" },
   "dependencies": {
     "axios": "^1.7.7",
