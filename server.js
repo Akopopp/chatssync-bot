@@ -40,6 +40,41 @@ async function getChatwootDb() {
   return chatwootDb;
 }
 
+// ---- Google Sheets (optional): auto-save Form answers into a user's sheet ----
+const GOOGLE_SA_JSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON || "";
+let sheetsClient = null, sheetsTried = false;
+async function getSheets() {
+  if (sheetsClient || sheetsTried) return sheetsClient;
+  sheetsTried = true;
+  if (!GOOGLE_SA_JSON) return null;
+  try {
+    const { google } = await import("googleapis");
+    const creds = JSON.parse(GOOGLE_SA_JSON);
+    const auth = new google.auth.GoogleAuth({ credentials: creds, scopes: ["https://www.googleapis.com/auth/spreadsheets"] });
+    sheetsClient = google.sheets({ version: "v4", auth });
+    console.log("googleSheets: ready as " + (creds.client_email || "?"));
+  } catch (e) { console.error("googleSheets init FAIL", e.message); sheetsClient = null; }
+  return sheetsClient;
+}
+async function appendToSheet(sheetUrl, data) {
+  try {
+    if (!sheetUrl) return;
+    const m = String(sheetUrl).match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+    if (!m) { console.log("appendToSheet: bad sheet url"); return; }
+    const sheets = await getSheets();
+    if (!sheets) { console.log("appendToSheet: GOOGLE_SERVICE_ACCOUNT_JSON not set"); return; }
+    const spreadsheetId = m[1];
+    let headers = [];
+    try { const r = await sheets.spreadsheets.values.get({ spreadsheetId, range: "A1:1" }); headers = (r.data.values && r.data.values[0]) || []; } catch (e) {}
+    let changed = false;
+    for (const k of Object.keys(data)) { if (!headers.includes(k)) { headers.push(k); changed = true; } }
+    if (changed) await sheets.spreadsheets.values.update({ spreadsheetId, range: "A1", valueInputOption: "RAW", requestBody: { values: [headers] } });
+    const row = headers.map((h) => (data[h] !== undefined && data[h] !== null ? String(data[h]) : ""));
+    await sheets.spreadsheets.values.append({ spreadsheetId, range: "A1", valueInputOption: "RAW", insertDataOption: "INSERT_ROWS", requestBody: { values: [row] } });
+    console.log("appendToSheet OK", spreadsheetId);
+  } catch (e) { console.error("appendToSheet FAIL", e.response?.data?.error?.message || e.message); }
+}
+
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 const seedFlow = JSON.parse(fs.readFileSync("./flow.json", "utf-8"));
@@ -581,6 +616,7 @@ app.post("/webhook", async (req, res) => {
       const summary = "📋 *Form submitted:*\n" + ff.map((fd, i) => `• ${fd.key || ("field_" + (i + 1))}: ${fans[fd.key || ("field_" + (i + 1))] || "-"}`).join("\n");
       await sendText(accountId, conversationId, summary);
       if (fnode && fnode.submit_message) await sendText(accountId, conversationId, fnode.submit_message);
+      if (fnode && fnode.sheet_url) { try { const _ci = await getConvInfo(accountId, conversationId); await appendToSheet(fnode.sheet_url, { Time: new Date().toLocaleString(), Phone: (_ci && _ci.number) || "", ...fans }); } catch (e) {} }
       delete s.variables.__form_idx; delete s.variables.__form_answers;
       s.awaiting = null; s.nodeId = (fnode && fnode.next) || null;
       await advance(accountId, conversationId, s, def);
