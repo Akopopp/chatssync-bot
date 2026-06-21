@@ -8,6 +8,7 @@ import path from "path";
 import multer from "multer";
 import FormData from "form-data";
 import { spawn } from "child_process";
+import crypto from "crypto";
 import {
   initDb, seedFlowIfEmpty, getPublishedFlowForInbox, getSession, saveSession,
   listFlows, createFlow, getFlowById, saveFlowById, publishFlowById, unpublishFlowById, deleteFlowById, assignInbox,
@@ -40,38 +41,42 @@ async function getChatwootDb() {
   return chatwootDb;
 }
 
-// ---- Google Sheets (optional): auto-save Form answers into a user's sheet ----
+// ---- Google Sheets (optional): auto-save Form answers into a user's sheet (NO extra package) ----
 const GOOGLE_SA_JSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON || "";
-let sheetsClient = null, sheetsTried = false;
-async function getSheets() {
-  if (sheetsClient || sheetsTried) return sheetsClient;
-  sheetsTried = true;
+let _gTok = null, _gTokExp = 0;
+async function getGoogleToken() {
   if (!GOOGLE_SA_JSON) return null;
+  if (_gTok && Date.now() < _gTokExp - 60000) return _gTok;
   try {
-    const { google } = await import("googleapis");
     const creds = JSON.parse(GOOGLE_SA_JSON);
-    const auth = new google.auth.GoogleAuth({ credentials: creds, scopes: ["https://www.googleapis.com/auth/spreadsheets"] });
-    sheetsClient = google.sheets({ version: "v4", auth });
-    console.log("googleSheets: ready as " + (creds.client_email || "?"));
-  } catch (e) { console.error("googleSheets init FAIL", e.message); sheetsClient = null; }
-  return sheetsClient;
+    const now = Math.floor(Date.now() / 1000);
+    const b64u = (o) => Buffer.from(JSON.stringify(o)).toString("base64url");
+    const unsigned = b64u({ alg: "RS256", typ: "JWT" }) + "." + b64u({ iss: creds.client_email, scope: "https://www.googleapis.com/auth/spreadsheets", aud: "https://oauth2.googleapis.com/token", exp: now + 3600, iat: now });
+    const signature = crypto.createSign("RSA-SHA256").update(unsigned).sign((creds.private_key || "").replace(/\\n/g, "\n"), "base64url");
+    const r = await axios.post("https://oauth2.googleapis.com/token", new URLSearchParams({ grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer", assertion: unsigned + "." + signature }).toString(), { headers: { "Content-Type": "application/x-www-form-urlencoded" }, timeout: 15000 });
+    _gTok = r.data.access_token; _gTokExp = Date.now() + (r.data.expires_in || 3600) * 1000;
+    console.log("googleSheets: token ok (" + (creds.client_email || "?") + ")");
+    return _gTok;
+  } catch (e) { console.error("googleSheets token FAIL", e.response?.data?.error_description || e.message); return null; }
 }
 async function appendToSheet(sheetUrl, data) {
   try {
     if (!sheetUrl) return;
     const m = String(sheetUrl).match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
     if (!m) { console.log("appendToSheet: bad sheet url"); return; }
-    const sheets = await getSheets();
-    if (!sheets) { console.log("appendToSheet: GOOGLE_SERVICE_ACCOUNT_JSON not set"); return; }
-    const spreadsheetId = m[1];
+    const token = await getGoogleToken();
+    if (!token) { console.log("appendToSheet: GOOGLE_SERVICE_ACCOUNT_JSON not set/invalid"); return; }
+    const id = m[1];
+    const base = `https://sheets.googleapis.com/v4/spreadsheets/${id}/values`;
+    const H = { headers: { Authorization: `Bearer ${token}` }, timeout: 15000 };
     let headers = [];
-    try { const r = await sheets.spreadsheets.values.get({ spreadsheetId, range: "A1:1" }); headers = (r.data.values && r.data.values[0]) || []; } catch (e) {}
+    try { const r = await axios.get(`${base}/A1:1`, H); headers = (r.data.values && r.data.values[0]) || []; } catch (e) {}
     let changed = false;
     for (const k of Object.keys(data)) { if (!headers.includes(k)) { headers.push(k); changed = true; } }
-    if (changed) await sheets.spreadsheets.values.update({ spreadsheetId, range: "A1", valueInputOption: "RAW", requestBody: { values: [headers] } });
-    const row = headers.map((h) => (data[h] !== undefined && data[h] !== null ? String(data[h]) : ""));
-    await sheets.spreadsheets.values.append({ spreadsheetId, range: "A1", valueInputOption: "RAW", insertDataOption: "INSERT_ROWS", requestBody: { values: [row] } });
-    console.log("appendToSheet OK", spreadsheetId);
+    if (changed) await axios.put(`${base}/A1?valueInputOption=RAW`, { values: [headers] }, H);
+    const row = headers.map((h) => (data[h] != null ? String(data[h]) : ""));
+    await axios.post(`${base}/A1:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`, { values: [row] }, H);
+    console.log("appendToSheet OK", id);
   } catch (e) { console.error("appendToSheet FAIL", e.response?.data?.error?.message || e.message); }
 }
 
