@@ -410,11 +410,11 @@ async function sendMedia(a, c, url, caption) {
       buffer = Buffer.from(resp.data);
     }
     const tx = await maybeTranscodeAudio(buffer, path.basename(baseName)); // auto -> mp3 for audio
-    const form = new FormData();
-    if (caption) form.append("content", caption);
-    form.append("message_type", "outgoing");
-    form.append("attachments[]", tx.buffer, { filename: tx.filename, contentType: tx.contentType });
-    await cw.post(`${CHATWOOT_BASE_URL}/api/v1/accounts/${a}/conversations/${c}/messages`, form, { headers: { api_access_token: BOT_TOKEN, ...form.getHeaders() }, maxContentLength: Infinity, maxBodyLength: Infinity });
+    const mediaUrl = `${CHATWOOT_BASE_URL}/api/v1/accounts/${a}/conversations/${c}/messages`;
+    const mkForm = () => { const f = new FormData(); if (caption) f.append("content", caption); f.append("message_type", "outgoing"); f.append("attachments[]", tx.buffer, { filename: tx.filename, contentType: tx.contentType }); return f; };
+    const postForm = (tok) => { const f = mkForm(); return cw.post(mediaUrl, f, { headers: { api_access_token: tok, ...f.getHeaders() }, maxContentLength: Infinity, maxBodyLength: Infinity }); };
+    try { await postForm(BOT_TOKEN); }
+    catch (e) { const st = e.response?.status; if ((st === 401 || st === 403) && ADMIN_TOKEN && ADMIN_TOKEN !== BOT_TOKEN) { console.log("sendMedia: bot token rejected (" + st + "), retrying with admin token"); await postForm(ADMIN_TOKEN); } else throw e; }
   } catch (e) { console.error("sendMedia", e.response?.data || e.message); }
 }
 
