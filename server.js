@@ -562,9 +562,14 @@ app.post("/webhook", async (req, res) => {
     if (event.event === "message_updated" && Array.isArray(submitted) && submitted.length > 0) {
       const choice = (submitted[0].value || submitted[0].title || "").trim();
       if (session) {
-        const optsNode = session.node_id || (session.variables && (typeof session.variables === "string" ? JSON.parse(session.variables).__opts : session.variables.__opts));
-        const next = matchChoice(def.nodes[session.node_id] || def.nodes[optsNode], choice);
-        if (next) { const s = toSession(session, flowPublishedAt); s.variables.last_message = choice; s.nodeId = next; s.awaiting = null; await advance(accountId, conversationId, s, def); }
+        const menuId = session.node_id || (session.variables && (typeof session.variables === "string" ? JSON.parse(session.variables).__opts : session.variables.__opts));
+        const menuNode = def.nodes[session.node_id] || def.nodes[menuId];
+        const next = matchChoice(menuNode, choice);
+        const s = toSession(session, flowPublishedAt); s.variables.last_message = choice;
+        if (next) {
+          s.nodeId = next; s.awaiting = null; await advance(accountId, conversationId, s, def);
+          if (menuNode && menuNode.loop_menu && !s.awaiting && !s.nodeId) { s.nodeId = menuId; await advance(accountId, conversationId, s, def); }
+        } else if (menuNode && menuNode.loop_menu) { s.nodeId = menuId; s.awaiting = null; await advance(accountId, conversationId, s, def); }
       }
       return;
     }
@@ -596,6 +601,7 @@ app.post("/webhook", async (req, res) => {
         s.nodeId = next; s.awaiting = null; await advance(accountId, conversationId, s, def);
         if (menuNode && menuNode.loop_menu && !s.awaiting && !s.nodeId) { s.nodeId = menuId; await advance(accountId, conversationId, s, def); }
       }
+      else if (menuNode && menuNode.loop_menu) { s.nodeId = menuId; s.awaiting = null; await advance(accountId, conversationId, s, def); } // unconnected/invalid tap -> re-show menu so the user is never stuck
       else { await saveSession(accountId, conversationId, s); } // no match -> stay, keep last_message
       return;
     }
