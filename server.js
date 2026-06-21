@@ -590,8 +590,12 @@ app.post("/webhook", async (req, res) => {
 
     // --- WhatsApp: a button/list reply comes back as a normal incoming text (the option's title) ---
     if (session.awaiting === "buttons" || session.awaiting === "list") {
-      const next = matchChoice(def.nodes[session.node_id], text);
-      if (next) { s.nodeId = next; s.awaiting = null; await advance(accountId, conversationId, s, def); }
+      const menuId = session.node_id; const menuNode = def.nodes[menuId];
+      const next = matchChoice(menuNode, text);
+      if (next) {
+        s.nodeId = next; s.awaiting = null; await advance(accountId, conversationId, s, def);
+        if (menuNode && menuNode.loop_menu && !s.awaiting && !s.nodeId) { s.nodeId = menuId; await advance(accountId, conversationId, s, def); }
+      }
       else { await saveSession(accountId, conversationId, s); } // no match -> stay, keep last_message
       return;
     }
@@ -630,8 +634,13 @@ app.post("/webhook", async (req, res) => {
 
     // Flow ended, but the user tapped a button/row from the LAST options prompt -> honour it
     if (s.variables.__opts) {
-      const next = matchChoice(def.nodes[s.variables.__opts], text);
-      if (next) { s.nodeId = next; s.awaiting = null; await advance(accountId, conversationId, s, def); return; }
+      const menuId = s.variables.__opts; const menuNode = def.nodes[menuId];
+      const next = matchChoice(menuNode, text);
+      if (next) {
+        s.nodeId = next; s.awaiting = null; await advance(accountId, conversationId, s, def);
+        if (menuNode && menuNode.loop_menu && !s.awaiting && !s.nodeId) { s.nodeId = menuId; await advance(accountId, conversationId, s, def); }
+        return;
+      }
     }
     // otherwise stay quiet (agent may be handling it)
     return;
