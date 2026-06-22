@@ -488,7 +488,7 @@ async function runFlow(a, c, s, def) {
         const opts = (node.buttons || []).map((b, i) => `${i + 1}. ${b.title}`).join("\n");
         await sendText(a, c, withHeaderFooter(node, (node.text || "Choose an option:") + "\n\n" + opts));
       } else { await sendHeaderMedia(a, c, node); await sendOptions(a, c, withHeaderFooter(node, node.text), (node.buttons || []).map((b) => b.title)); }
-      s.awaiting = "buttons"; s.variables.__opts = s.nodeId; return;
+      s.awaiting = "buttons"; s.variables.__opts = s.nodeId; s.variables.__menus = [...(s.variables.__menus || []).filter((x) => x !== s.nodeId), s.nodeId].slice(-8); return;
     }
 
     if (node.type === "list") {
@@ -507,7 +507,7 @@ async function runFlow(a, c, s, def) {
           await sendOptions(a, c, withHeaderFooter(node, lbody), rows.map((r) => r.title));
         }
       }
-      s.awaiting = "list"; s.variables.__opts = s.nodeId; return;
+      s.awaiting = "list"; s.variables.__opts = s.nodeId; s.variables.__menus = [...(s.variables.__menus || []).filter((x) => x !== s.nodeId), s.nodeId].slice(-8); return;
     }
 
     if (node.type === "form") {
@@ -560,6 +560,25 @@ function matchChoice(node, choice) {
   return null;
 }
 
+// Match a reply against the CURRENT menu, the last menu, or ANY menu shown earlier in this chat,
+// so a button from an older menu still works even after the flow moved on.
+function resolveMenuChoice(def, s, text) {
+  const vars = s.variables || {};
+  const order = [];
+  if (s.awaiting === "buttons" || s.awaiting === "list") order.push(s.nodeId);
+  if (vars.__opts) order.push(vars.__opts);
+  const menus = vars.__menus || [];
+  for (let i = menus.length - 1; i >= 0; i--) order.push(menus[i]);
+  const tried = new Set();
+  for (const id of order) {
+    if (id == null || tried.has(id)) continue;
+    tried.add(id);
+    const next = matchChoice(def.nodes[id], text);
+    if (next) return { menuId: id, next };
+  }
+  return null;
+}
+
 app.post("/webhook", async (req, res) => {
   res.sendStatus(200);
   try {
@@ -578,14 +597,16 @@ app.post("/webhook", async (req, res) => {
     if (event.event === "message_updated" && Array.isArray(submitted) && submitted.length > 0) {
       const choice = (submitted[0].value || submitted[0].title || "").trim();
       if (session) {
-        const menuId = session.node_id || (session.variables && (typeof session.variables === "string" ? JSON.parse(session.variables).__opts : session.variables.__opts));
-        const menuNode = def.nodes[session.node_id] || def.nodes[menuId];
-        const next = matchChoice(menuNode, choice);
         const s = toSession(session, flowPublishedAt); s.variables.last_message = choice;
-        if (next) {
-          s.nodeId = next; s.awaiting = null; await advance(accountId, conversationId, s, def);
-          if (menuNode && menuNode.loop_menu && !s.awaiting && !s.nodeId) { s.nodeId = menuId; await advance(accountId, conversationId, s, def); }
-        } else if (menuNode && menuNode.loop_menu) { s.nodeId = menuId; s.awaiting = null; await advance(accountId, conversationId, s, def); }
+        const mc = resolveMenuChoice(def, s, choice);
+        if (mc) {
+          const mNode = def.nodes[mc.menuId];
+          s.nodeId = mc.next; s.awaiting = null; await advance(accountId, conversationId, s, def);
+          if (mNode && mNode.loop_menu && !s.awaiting && !s.nodeId) { s.nodeId = mc.menuId; await advance(accountId, conversationId, s, def); }
+        } else if (s.awaiting === "buttons" || s.awaiting === "list") {
+          const cur = def.nodes[s.nodeId];
+          if (cur && cur.loop_menu) { s.awaiting = null; await advance(accountId, conversationId, s, def); }
+        }
       }
       return;
     }
@@ -608,19 +629,6 @@ app.post("/webhook", async (req, res) => {
 
     const s = toSession(session, flowPublishedAt);
     s.variables.last_message = text;
-
-    // --- WhatsApp: a button/list reply comes back as a normal incoming text (the option's title) ---
-    if (session.awaiting === "buttons" || session.awaiting === "list") {
-      const menuId = session.node_id; const menuNode = def.nodes[menuId];
-      const next = matchChoice(menuNode, text);
-      if (next) {
-        s.nodeId = next; s.awaiting = null; await advance(accountId, conversationId, s, def);
-        if (menuNode && menuNode.loop_menu && !s.awaiting && !s.nodeId) { s.nodeId = menuId; await advance(accountId, conversationId, s, def); }
-      }
-      else if (menuNode && menuNode.loop_menu) { s.nodeId = menuId; s.awaiting = null; await advance(accountId, conversationId, s, def); } // unconnected/invalid tap -> re-show menu so the user is never stuck
-      else { await saveSession(accountId, conversationId, s); } // no match -> stay, keep last_message
-      return;
-    }
 
     if (session.awaiting === "question") {
       const node = def.nodes[session.node_id];
@@ -654,15 +662,20 @@ app.post("/webhook", async (req, res) => {
       return;
     }
 
-    // Flow ended, but the user tapped a button/row from the LAST options prompt -> honour it
-    if (s.variables.__opts) {
-      const menuId = s.variables.__opts; const menuNode = def.nodes[menuId];
-      const next = matchChoice(menuNode, text);
-      if (next) {
-        s.nodeId = next; s.awaiting = null; await advance(accountId, conversationId, s, def);
-        if (menuNode && menuNode.loop_menu && !s.awaiting && !s.nodeId) { s.nodeId = menuId; await advance(accountId, conversationId, s, def); }
-        return;
-      }
+    // The reply may be a tap from the CURRENT menu OR any menu shown earlier in this chat -> route it
+    const mc = resolveMenuChoice(def, s, text);
+    if (mc) {
+      const mNode = def.nodes[mc.menuId];
+      s.nodeId = mc.next; s.awaiting = null; await advance(accountId, conversationId, s, def);
+      if (mNode && mNode.loop_menu && !s.awaiting && !s.nodeId) { s.nodeId = mc.menuId; await advance(accountId, conversationId, s, def); }
+      return;
+    }
+    // Awaiting a menu but the tap matched nothing -> re-show it (loop) so the user is never stuck, else stay quiet
+    if (session.awaiting === "buttons" || session.awaiting === "list") {
+      const cur = def.nodes[session.node_id];
+      if (cur && cur.loop_menu) { s.nodeId = session.node_id; s.awaiting = null; await advance(accountId, conversationId, s, def); }
+      else { await saveSession(accountId, conversationId, s); }
+      return;
     }
     // otherwise stay quiet (agent may be handling it)
     return;
