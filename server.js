@@ -482,16 +482,30 @@ async function runFlow(a, c, s, def) {
 
     if (node.type === "condition") { const ok = evalConditionNode(node, s.variables || {}); s.nodeId = ok ? (node.next_true || null) : (node.next_false || null); if (s.nodeId) continue; s.awaiting = null; return; }
 
-    if (node.type === "buttons") { await sendHeaderMedia(a, c, node); await sendOptions(a, c, withHeaderFooter(node, node.text), (node.buttons || []).map((b) => b.title)); s.awaiting = "buttons"; s.variables.__opts = s.nodeId; return; }
+    if (node.type === "buttons") {
+      if (node.text_menu) {
+        await sendHeaderMedia(a, c, node);
+        const opts = (node.buttons || []).map((b, i) => `${i + 1}. ${b.title}`).join("\n");
+        await sendText(a, c, withHeaderFooter(node, (node.text || "Choose an option:") + "\n\n" + opts));
+      } else { await sendHeaderMedia(a, c, node); await sendOptions(a, c, withHeaderFooter(node, node.text), (node.buttons || []).map((b) => b.title)); }
+      s.awaiting = "buttons"; s.variables.__opts = s.nodeId; return;
+    }
 
     if (node.type === "list") {
-      const okl = await trySendListNative(a, c, node);
-      if (!okl) {
+      if (node.text_menu) {
         await sendHeaderMedia(a, c, node);
         const rows = listRows(node);
-        let lbody = node.body || "";
-        if (rows.some((r) => r.description)) lbody += "\n\n" + rows.map((r) => r.description ? `▸ ${r.title} — ${r.description}` : `▸ ${r.title}`).join("\n");
-        await sendOptions(a, c, withHeaderFooter(node, lbody), rows.map((r) => r.title));
+        const opts = rows.map((r, i) => r.description ? `${i + 1}. ${r.title} — ${r.description}` : `${i + 1}. ${r.title}`).join("\n");
+        await sendText(a, c, withHeaderFooter(node, (node.body || "Choose an option:") + "\n\n" + opts));
+      } else {
+        const okl = await trySendListNative(a, c, node);
+        if (!okl) {
+          await sendHeaderMedia(a, c, node);
+          const rows = listRows(node);
+          let lbody = node.body || "";
+          if (rows.some((r) => r.description)) lbody += "\n\n" + rows.map((r) => r.description ? `▸ ${r.title} — ${r.description}` : `▸ ${r.title}`).join("\n");
+          await sendOptions(a, c, withHeaderFooter(node, lbody), rows.map((r) => r.title));
+        }
       }
       s.awaiting = "list"; s.variables.__opts = s.nodeId; return;
     }
@@ -539,8 +553,10 @@ function scheduleQuestionTimeout(a, c, s, def) {
 function matchChoice(node, choice) {
   const t = norm(choice);
   if (!node) return null;
-  if (node.type === "buttons") { const b = (node.buttons || []).find((x) => norm(x.title) === t); return b ? (b.next || null) : null; }
-  if (node.type === "list") { const r = listRows(node).find((x) => norm(x.title) === t); return r ? (r.next || null) : null; }
+  const raw = String(choice).trim();
+  const byNum = (arr) => { if (/^\d+$/.test(raw)) { const n = parseInt(raw, 10); if (n >= 1 && n <= arr.length) return arr[n - 1]; } return null; };
+  if (node.type === "buttons") { const arr = node.buttons || []; const hit = byNum(arr) || arr.find((x) => norm(x.title) === t); return hit ? (hit.next || null) : null; }
+  if (node.type === "list") { const arr = listRows(node); const hit = byNum(arr) || arr.find((x) => norm(x.title) === t); return hit ? (hit.next || null) : null; }
   return null;
 }
 
