@@ -478,7 +478,19 @@ async function runFlow(a, c, s, def) {
 
     if (node.type === "tag") { await addLabels(a, c, node.labels || []); s.nodeId = node.next || null; if (s.nodeId) continue; s.awaiting = null; return; }
 
-    if (node.type === "delay") { const secs = Math.max(0, Math.min(parseInt(node.seconds, 10) || 0, 300)); if (secs > 0) await sleep(secs * 1000); s.nodeId = node.next || null; if (s.nodeId) continue; s.awaiting = null; return; }
+    if (node.type === "delay") {
+      const secs = Math.max(0, Math.min(parseInt(node.seconds, 10) || 0, 86400));
+      if (secs > 0) {
+        // Non-blocking, persisted delay. We stop here (the messages already sent stay immediate)
+        // and advance() schedules the resume. This honors the full duration, only delays the NEXT
+        // message, and lets a re-publish cancel a stale pending delay.
+        s.awaiting = "delay";
+        s.variables.__delay_token = Math.random().toString(36).slice(2);
+        s.variables.__delay_next = node.next || null;
+        return;
+      }
+      s.nodeId = node.next || null; if (s.nodeId) continue; s.awaiting = null; return;
+    }
 
     if (node.type === "condition") { const ok = evalConditionNode(node, s.variables || {}); s.nodeId = ok ? (node.next_true || null) : (node.next_false || null); if (s.nodeId) continue; s.awaiting = null; return; }
 
@@ -526,7 +538,40 @@ async function runFlow(a, c, s, def) {
 }
 
 // runFlow + persist + (re)schedule question timeout
-async function advance(a, c, s, def) { await runFlow(a, c, s, def); await saveSession(a, c, s); scheduleQuestionTimeout(a, c, s, def); }
+async function advance(a, c, s, def) { await runFlow(a, c, s, def); await saveSession(a, c, s); scheduleQuestionTimeout(a, c, s, def); scheduleDelayResume(a, c, s, def); }
+
+// Persisted, non-blocking delay resume. Mirrors scheduleQuestionTimeout but always continues.
+function scheduleDelayResume(a, c, s, def) {
+  if (s.awaiting !== "delay") return;
+  const node = def.nodes[s.nodeId];
+  if (!node || node.type !== "delay") return;
+  const secs = Math.max(0, Math.min(parseInt(node.seconds, 10) || 0, 86400));
+  if (secs <= 0) return;
+  const token = s.variables.__delay_token;
+  const nextId = s.variables.__delay_next || null;
+  const inboxId = (s.variables.__inbox != null ? s.variables.__inbox : null);
+  const publishedAt = s.flowPublishedAt;
+  setTimeout(async () => {
+    try {
+      const cur = await getSession(a, c);
+      if (!cur || cur.awaiting !== "delay") return;                 // user/flow already moved on
+      const vars = typeof cur.variables === "string" ? JSON.parse(cur.variables) : (cur.variables || {});
+      if (vars.__delay_token !== token) return;                     // a newer delay replaced this one
+      const fr = await cachedPublishedFlow(a, inboxId);
+      if (!fr) return;
+      // re-publish guard: if the flow was re-published after this delay began, cancel the stale delay
+      if (new Date(fr.published_at).toISOString() !== publishedAt) return;
+      const curDef = parseDef(fr.definition);
+      const ns = toSession(cur, publishedAt);
+      delete ns.variables.__delay_token; delete ns.variables.__delay_next;
+      ns.awaiting = null; ns.nodeId = nextId;
+      await runFlow(a, c, ns, curDef);
+      await saveSession(a, c, ns);
+      scheduleQuestionTimeout(a, c, ns, curDef);
+      scheduleDelayResume(a, c, ns, curDef);   // support a chain with another delay further on
+    } catch (e) { console.error("delayresume", e.message); }
+  }, secs * 1000);
+}
 
 function scheduleQuestionTimeout(a, c, s, def) {
   if (s.awaiting !== "question") return;
@@ -597,7 +642,7 @@ app.post("/webhook", async (req, res) => {
     if (event.event === "message_updated" && Array.isArray(submitted) && submitted.length > 0) {
       const choice = (submitted[0].value || submitted[0].title || "").trim();
       if (session) {
-        const s = toSession(session, flowPublishedAt); s.variables.last_message = choice;
+        const s = toSession(session, flowPublishedAt); s.variables.last_message = choice; s.variables.__inbox = inboxId;
         const mc = resolveMenuChoice(def, s, choice);
         if (mc) {
           const mNode = def.nodes[mc.menuId];
@@ -605,7 +650,8 @@ app.post("/webhook", async (req, res) => {
           if (mNode && mNode.loop_menu && !s.awaiting && !s.nodeId) { s.nodeId = mc.menuId; await advance(accountId, conversationId, s, def); }
         } else if (s.awaiting === "buttons" || s.awaiting === "list") {
           const cur = def.nodes[s.nodeId];
-          if (cur && cur.loop_menu) { s.awaiting = null; await advance(accountId, conversationId, s, def); }
+          if (cur && cur.next) { s.awaiting = null; s.nodeId = cur.next; await advance(accountId, conversationId, s, def); }
+          else if (cur && cur.loop_menu) { s.awaiting = null; await advance(accountId, conversationId, s, def); }
         }
       }
       return;
@@ -622,13 +668,17 @@ app.post("/webhook", async (req, res) => {
       const trig = def.trigger || {};
       if (trig.keywords && trig.keywords.length && !matchKeywords(text, trig.keywords, trig.fuzzy, trig.sensitivity)) return; // keyword set but not matched -> don't start
       openConversation(accountId, conversationId); // fire-and-forget (don't delay the reply)
-      const s = { nodeId: def.start, awaiting: null, variables: { last_message: text }, flowPublishedAt };
+      const s = { nodeId: def.start, awaiting: null, variables: { last_message: text, __inbox: inboxId }, flowPublishedAt };
       await advance(accountId, conversationId, s, def);
       return;
     }
 
     const s = toSession(session, flowPublishedAt);
     s.variables.last_message = text;
+    s.variables.__inbox = inboxId;
+
+    // While a delay is pending, ignore incoming messages — the timer resumes the flow.
+    if (session.awaiting === "delay") { await saveSession(accountId, conversationId, s); return; }
 
     if (session.awaiting === "question") {
       const node = def.nodes[session.node_id];
@@ -673,7 +723,8 @@ app.post("/webhook", async (req, res) => {
     // Awaiting a menu but the tap matched nothing -> re-show it (loop) so the user is never stuck, else stay quiet
     if (session.awaiting === "buttons" || session.awaiting === "list") {
       const cur = def.nodes[session.node_id];
-      if (cur && cur.loop_menu) { s.nodeId = session.node_id; s.awaiting = null; await advance(accountId, conversationId, s, def); }
+      if (cur && cur.next) { s.awaiting = null; s.nodeId = cur.next; await advance(accountId, conversationId, s, def); }
+      else if (cur && cur.loop_menu) { s.nodeId = session.node_id; s.awaiting = null; await advance(accountId, conversationId, s, def); }
       else { await saveSession(accountId, conversationId, s); }
       return;
     }
