@@ -500,7 +500,9 @@ async function runFlow(a, c, s, def) {
         const opts = (node.buttons || []).map((b, i) => `${i + 1}. ${b.title}`).join("\n");
         await sendText(a, c, withHeaderFooter(node, (node.text || "Choose an option:") + "\n\n" + opts));
       } else { await sendHeaderMedia(a, c, node); await sendOptions(a, c, withHeaderFooter(node, node.text), (node.buttons || []).map((b) => b.title)); }
-      s.awaiting = "buttons"; s.variables.__opts = s.nodeId; s.variables.__menus = [...(s.variables.__menus || []).filter((x) => x !== s.nodeId), s.nodeId].slice(-8); return;
+      s.variables.__opts = s.nodeId; s.variables.__menus = [...(s.variables.__menus || []).filter((x) => x !== s.nodeId), s.nodeId].slice(-8);
+      if (node.next) { s.nodeId = node.next; s.awaiting = null; continue; } // default output -> keep flowing immediately (buttons stay tappable via menu memory)
+      s.awaiting = "buttons"; return;
     }
 
     if (node.type === "list") {
@@ -519,7 +521,9 @@ async function runFlow(a, c, s, def) {
           await sendOptions(a, c, withHeaderFooter(node, lbody), rows.map((r) => r.title));
         }
       }
-      s.awaiting = "list"; s.variables.__opts = s.nodeId; s.variables.__menus = [...(s.variables.__menus || []).filter((x) => x !== s.nodeId), s.nodeId].slice(-8); return;
+      s.variables.__opts = s.nodeId; s.variables.__menus = [...(s.variables.__menus || []).filter((x) => x !== s.nodeId), s.nodeId].slice(-8);
+      if (node.next) { s.nodeId = node.next; s.awaiting = null; continue; } // default output -> keep flowing immediately (list stays tappable via menu memory)
+      s.awaiting = "list"; return;
     }
 
     if (node.type === "form") {
@@ -650,8 +654,7 @@ app.post("/webhook", async (req, res) => {
           if (mNode && mNode.loop_menu && !s.awaiting && !s.nodeId) { s.nodeId = mc.menuId; await advance(accountId, conversationId, s, def); }
         } else if (s.awaiting === "buttons" || s.awaiting === "list") {
           const cur = def.nodes[s.nodeId];
-          if (cur && cur.next) { s.awaiting = null; s.nodeId = cur.next; await advance(accountId, conversationId, s, def); }
-          else if (cur && cur.loop_menu) { s.awaiting = null; await advance(accountId, conversationId, s, def); }
+          if (cur && cur.loop_menu) { s.awaiting = null; await advance(accountId, conversationId, s, def); }
         }
       }
       return;
@@ -676,9 +679,6 @@ app.post("/webhook", async (req, res) => {
     const s = toSession(session, flowPublishedAt);
     s.variables.last_message = text;
     s.variables.__inbox = inboxId;
-
-    // While a delay is pending, ignore incoming messages — the timer resumes the flow.
-    if (session.awaiting === "delay") { await saveSession(accountId, conversationId, s); return; }
 
     if (session.awaiting === "question") {
       const node = def.nodes[session.node_id];
@@ -723,8 +723,7 @@ app.post("/webhook", async (req, res) => {
     // Awaiting a menu but the tap matched nothing -> re-show it (loop) so the user is never stuck, else stay quiet
     if (session.awaiting === "buttons" || session.awaiting === "list") {
       const cur = def.nodes[session.node_id];
-      if (cur && cur.next) { s.awaiting = null; s.nodeId = cur.next; await advance(accountId, conversationId, s, def); }
-      else if (cur && cur.loop_menu) { s.nodeId = session.node_id; s.awaiting = null; await advance(accountId, conversationId, s, def); }
+      if (cur && cur.loop_menu) { s.nodeId = session.node_id; s.awaiting = null; await advance(accountId, conversationId, s, def); }
       else { await saveSession(accountId, conversationId, s); }
       return;
     }
