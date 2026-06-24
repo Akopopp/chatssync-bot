@@ -466,79 +466,78 @@ async function sendHeaderMedia(a, c, node) { const h = node.header || {}; if (["
 function withHeaderFooter(node, body) { let out = (node.header && node.header.type === "text" && node.header.value ? node.header.value + "\n\n" : "") + (body || ""); if (node.footer) out += "\n\n_" + node.footer + "_"; return out; }
 
 async function runFlow(a, c, s, def) {
-  for (let i = 0; i < 100; i++) {
-    const node = def.nodes[s.nodeId];
-    if (!node) { s.awaiting = null; s.nodeId = null; return; }
+  // Queue-based walker. A node's `next` may be a single id OR an array of ids; every target
+  // runs (fan-out). Existing single-`next` flows behave exactly as before (queue of one).
+  // Menus are recorded so every shown menu stays tappable (menu memory). At most one await
+  // state is kept; if several awaiting nodes appear in one fan-out, the last one wins.
+  const startId = s.nodeId;
+  const queue = Array.isArray(startId) ? startId.filter(Boolean) : (startId ? [startId] : []);
+  if (!queue.length) { s.awaiting = null; s.nodeId = null; return; }
+  const seen = new Set();
+  const nextsOf = (node) => { const v = node.next; const arr = Array.isArray(v) ? v : (v ? [v] : []); return arr.filter(Boolean); };
+  let awaitNode = null;   // { type, nodeId }
+  let delayNode = null;   // { nodeId, next }
+  let steps = 0;
 
-    if (node.type === "text") { await sendText(a, c, node.text); s.nodeId = node.next || null; if (s.nodeId) continue; s.awaiting = null; return; }
+  while (queue.length && steps < 300) {
+    steps++;
+    const id = queue.shift();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    const node = def.nodes[id];
+    if (!node) continue;
 
-    if (node.type === "media") { await sendMedia(a, c, node.url, node.caption); s.nodeId = node.next || null; if (s.nodeId) continue; s.awaiting = null; return; }
-
-    if (node.type === "cta") { const okc = await trySendCtaNative(a, c, node); if (!okc) { await sendHeaderMedia(a, c, node); await sendText(a, c, ctaText(node)); } s.nodeId = node.next || null; if (s.nodeId) continue; s.awaiting = null; return; }
-
-    if (node.type === "tag") { await addLabels(a, c, node.labels || []); s.nodeId = node.next || null; if (s.nodeId) continue; s.awaiting = null; return; }
+    if (node.type === "text") { await sendText(a, c, node.text); nextsOf(node).forEach((x) => queue.push(x)); continue; }
+    if (node.type === "media") { await sendMedia(a, c, node.url, node.caption); nextsOf(node).forEach((x) => queue.push(x)); continue; }
+    if (node.type === "cta") { const okc = await trySendCtaNative(a, c, node); if (!okc) { await sendHeaderMedia(a, c, node); await sendText(a, c, ctaText(node)); } nextsOf(node).forEach((x) => queue.push(x)); continue; }
+    if (node.type === "tag") { await addLabels(a, c, node.labels || []); nextsOf(node).forEach((x) => queue.push(x)); continue; }
+    if (node.type === "handover") { if (node.text) await sendText(a, c, node.text); openConversation(a, c); continue; }
+    if (node.type === "condition") { const ok = evalConditionNode(node, s.variables || {}); const t = ok ? node.next_true : node.next_false; (Array.isArray(t) ? t : (t ? [t] : [])).forEach((x) => x && queue.push(x)); continue; }
 
     if (node.type === "delay") {
       const secs = Math.max(0, Math.min(parseInt(node.seconds, 10) || 0, 86400));
-      if (secs > 0) {
-        // Non-blocking, persisted delay. We stop here (the messages already sent stay immediate)
-        // and advance() schedules the resume. This honors the full duration, only delays the NEXT
-        // message, and lets a re-publish cancel a stale pending delay.
-        s.awaiting = "delay";
-        s.variables.__delay_token = Math.random().toString(36).slice(2);
-        s.variables.__delay_next = node.next || null;
-        return;
-      }
-      s.nodeId = node.next || null; if (s.nodeId) continue; s.awaiting = null; return;
+      if (secs <= 0) { nextsOf(node).forEach((x) => queue.push(x)); continue; }
+      delayNode = { nodeId: id, next: (Array.isArray(node.next) ? node.next : (node.next || null)) };
+      continue;
     }
 
-    if (node.type === "condition") { const ok = evalConditionNode(node, s.variables || {}); s.nodeId = ok ? (node.next_true || null) : (node.next_false || null); if (s.nodeId) continue; s.awaiting = null; return; }
-
-    if (node.type === "buttons") {
-      if (node.text_menu) {
-        await sendHeaderMedia(a, c, node);
-        const opts = (node.buttons || []).map((b, i) => `${i + 1}. ${b.title}`).join("\n");
-        await sendText(a, c, withHeaderFooter(node, (node.text || "Choose an option:") + "\n\n" + opts));
-      } else { await sendHeaderMedia(a, c, node); await sendOptions(a, c, withHeaderFooter(node, node.text), (node.buttons || []).map((b) => b.title)); }
-      s.variables.__opts = s.nodeId; s.variables.__menus = [...(s.variables.__menus || []).filter((x) => x !== s.nodeId), s.nodeId].slice(-8);
-      if (node.next) { s.nodeId = node.next; s.awaiting = null; continue; } // default output -> keep flowing immediately (buttons stay tappable via menu memory)
-      s.awaiting = "buttons"; return;
-    }
-
-    if (node.type === "list") {
-      if (node.text_menu) {
-        await sendHeaderMedia(a, c, node);
-        const rows = listRows(node);
-        const opts = rows.map((r, i) => r.description ? `${i + 1}. ${r.title} — ${r.description}` : `${i + 1}. ${r.title}`).join("\n");
-        await sendText(a, c, withHeaderFooter(node, (node.body || "Choose an option:") + "\n\n" + opts));
+    if (node.type === "buttons" || node.type === "list") {
+      if (node.type === "buttons") {
+        if (node.text_menu) { await sendHeaderMedia(a, c, node); const opts = (node.buttons || []).map((b, i) => `${i + 1}. ${b.title}`).join("\n"); await sendText(a, c, withHeaderFooter(node, (node.text || "Choose an option:") + "\n\n" + opts)); }
+        else { await sendHeaderMedia(a, c, node); await sendOptions(a, c, withHeaderFooter(node, node.text), (node.buttons || []).map((b) => b.title)); }
       } else {
-        const okl = await trySendListNative(a, c, node);
-        if (!okl) {
-          await sendHeaderMedia(a, c, node);
-          const rows = listRows(node);
-          let lbody = node.body || "";
-          if (rows.some((r) => r.description)) lbody += "\n\n" + rows.map((r) => r.description ? `▸ ${r.title} — ${r.description}` : `▸ ${r.title}`).join("\n");
-          await sendOptions(a, c, withHeaderFooter(node, lbody), rows.map((r) => r.title));
-        }
+        if (node.text_menu) { await sendHeaderMedia(a, c, node); const rows = listRows(node); const opts = rows.map((r, i) => r.description ? `${i + 1}. ${r.title} — ${r.description}` : `${i + 1}. ${r.title}`).join("\n"); await sendText(a, c, withHeaderFooter(node, (node.body || "Choose an option:") + "\n\n" + opts)); }
+        else { const okl = await trySendListNative(a, c, node); if (!okl) { await sendHeaderMedia(a, c, node); const rows = listRows(node); let lbody = node.body || ""; if (rows.some((r) => r.description)) lbody += "\n\n" + rows.map((r) => r.description ? `▸ ${r.title} — ${r.description}` : `▸ ${r.title}`).join("\n"); await sendOptions(a, c, withHeaderFooter(node, lbody), rows.map((r) => r.title)); } }
       }
-      s.variables.__opts = s.nodeId; s.variables.__menus = [...(s.variables.__menus || []).filter((x) => x !== s.nodeId), s.nodeId].slice(-8);
-      if (node.next) { s.nodeId = node.next; s.awaiting = null; continue; } // default output -> keep flowing immediately (list stays tappable via menu memory)
-      s.awaiting = "list"; return;
+      s.variables.__opts = id; s.variables.__menus = [...(s.variables.__menus || []).filter((x) => x !== id), id].slice(-8);
+      const dn = nextsOf(node);
+      if (dn.length) { dn.forEach((x) => queue.push(x)); } // default output(s) -> keep flowing immediately (menu stays tappable)
+      else { awaitNode = { type: node.type, nodeId: id }; } // terminal menu -> wait for a tap
+      continue;
     }
 
     if (node.type === "form") {
       if (node.intro) await sendText(a, c, node.intro);
       const ff = (node.fields || []).filter((fd) => (fd.label || "").trim());
-      if (!ff.length) { s.nodeId = node.next || null; if (s.nodeId) continue; s.awaiting = null; return; }
-      s.awaiting = "form"; s.variables.__form_idx = 0; s.variables.__form_answers = {};
-      await sendText(a, c, ff[0].label); return;
+      if (!ff.length) { nextsOf(node).forEach((x) => queue.push(x)); continue; }
+      s.variables.__form_idx = 0; s.variables.__form_answers = {};
+      await sendText(a, c, ff[0].label);
+      awaitNode = { type: "form", nodeId: id };
+      continue;
     }
-    if (node.type === "question") { await sendText(a, c, node.text); s.awaiting = "question"; s.variables.__q_token = Math.random().toString(36).slice(2); return; }
 
-    if (node.type === "handover") { if (node.text) await sendText(a, c, node.text); openConversation(a, c); s.awaiting = null; s.nodeId = null; return; }
-
-    s.awaiting = null; s.nodeId = null; return;
+    if (node.type === "question") {
+      await sendText(a, c, node.text);
+      s.variables.__q_token = Math.random().toString(36).slice(2);
+      awaitNode = { type: "question", nodeId: id };
+      continue;
+    }
+    // unknown -> terminal branch
   }
+
+  if (awaitNode) { s.awaiting = awaitNode.type; s.nodeId = awaitNode.nodeId; }
+  else if (delayNode) { s.awaiting = "delay"; s.nodeId = delayNode.nodeId; s.variables.__delay_token = Math.random().toString(36).slice(2); s.variables.__delay_next = delayNode.next; }
+  else { s.awaiting = null; s.nodeId = null; }
 }
 
 // runFlow + persist + (re)schedule question timeout
