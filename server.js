@@ -473,6 +473,7 @@ async function runFlow(a, c, s, def) {
   const startId = s.nodeId;
   const queue = Array.isArray(startId) ? startId.filter(Boolean) : (startId ? [startId] : []);
   if (!queue.length) { s.awaiting = null; s.nodeId = null; return; }
+  if (s.variables) { delete s.variables.__delay_token; delete s.variables.__delay_next; delete s.variables.__delay_secs; }
   const seen = new Set();
   const nextsOf = (node) => { const v = node.next; const arr = Array.isArray(v) ? v : (v ? [v] : []); return arr.filter(Boolean); };
   let awaitNode = null;   // { type, nodeId }
@@ -497,7 +498,7 @@ async function runFlow(a, c, s, def) {
     if (node.type === "delay") {
       const secs = Math.max(0, Math.min(parseInt(node.seconds, 10) || 0, 86400));
       if (secs <= 0) { nextsOf(node).forEach((x) => queue.push(x)); continue; }
-      delayNode = { nodeId: id, next: (Array.isArray(node.next) ? node.next : (node.next || null)) };
+      delayNode = { nodeId: id, next: (Array.isArray(node.next) ? node.next : (node.next || null)), secs };
       continue;
     }
 
@@ -535,8 +536,15 @@ async function runFlow(a, c, s, def) {
     // unknown -> terminal branch
   }
 
+  // a pending delay is recorded regardless of whether a menu/question is also awaiting,
+  // so the delayed branch still fires while the menu stays tappable
+  if (delayNode) {
+    s.variables.__delay_token = Math.random().toString(36).slice(2);
+    s.variables.__delay_next = delayNode.next;
+    s.variables.__delay_secs = delayNode.secs;
+  }
   if (awaitNode) { s.awaiting = awaitNode.type; s.nodeId = awaitNode.nodeId; }
-  else if (delayNode) { s.awaiting = "delay"; s.nodeId = delayNode.nodeId; s.variables.__delay_token = Math.random().toString(36).slice(2); s.variables.__delay_next = delayNode.next; }
+  else if (delayNode) { s.awaiting = "delay"; s.nodeId = delayNode.nodeId; }
   else { s.awaiting = null; s.nodeId = null; }
 }
 
@@ -545,33 +553,30 @@ async function advance(a, c, s, def) { await runFlow(a, c, s, def); await saveSe
 
 // Persisted, non-blocking delay resume. Mirrors scheduleQuestionTimeout but always continues.
 function scheduleDelayResume(a, c, s, def) {
-  if (s.awaiting !== "delay") return;
-  const node = def.nodes[s.nodeId];
-  if (!node || node.type !== "delay") return;
-  const secs = Math.max(0, Math.min(parseInt(node.seconds, 10) || 0, 86400));
+  const token = s.variables && s.variables.__delay_token;
+  if (!token) return;                                              // no pending delay
+  const secs = Math.max(0, Math.min(parseInt(s.variables.__delay_secs, 10) || 0, 86400));
   if (secs <= 0) return;
-  const token = s.variables.__delay_token;
   const nextId = s.variables.__delay_next || null;
   const inboxId = (s.variables.__inbox != null ? s.variables.__inbox : null);
   const publishedAt = s.flowPublishedAt;
   setTimeout(async () => {
     try {
       const cur = await getSession(a, c);
-      if (!cur || cur.awaiting !== "delay") return;                 // user/flow already moved on
+      if (!cur) return;
       const vars = typeof cur.variables === "string" ? JSON.parse(cur.variables) : (cur.variables || {});
-      if (vars.__delay_token !== token) return;                     // a newer delay replaced this one
+      if (vars.__delay_token !== token) return;                     // cancelled (user moved on) or replaced by a newer delay
       const fr = await cachedPublishedFlow(a, inboxId);
       if (!fr) return;
       // re-publish guard: if the flow was re-published after this delay began, cancel the stale delay
       if (new Date(fr.published_at).toISOString() !== publishedAt) return;
       const curDef = parseDef(fr.definition);
       const ns = toSession(cur, publishedAt);
-      delete ns.variables.__delay_token; delete ns.variables.__delay_next;
-      ns.awaiting = null; ns.nodeId = nextId;
+      ns.nodeId = nextId; ns.awaiting = null;                       // resume the delayed branch (runFlow clears the delay markers)
       await runFlow(a, c, ns, curDef);
       await saveSession(a, c, ns);
       scheduleQuestionTimeout(a, c, ns, curDef);
-      scheduleDelayResume(a, c, ns, curDef);   // support a chain with another delay further on
+      scheduleDelayResume(a, c, ns, curDef);                        // support a chain with another delay further on
     } catch (e) { console.error("delayresume", e.message); }
   }, secs * 1000);
 }
