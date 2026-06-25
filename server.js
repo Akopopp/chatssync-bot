@@ -827,19 +827,46 @@ function buildTemplateComponents(body) {
   if ((body.footer_text || "").trim()) comps.push({ type: "FOOTER", text: body.footer_text.trim() });
 
   // ---- BUTTONS (optional): quick replies + url + phone ----
+  const btns = buildButtonsArray(body.buttons || []);
+  if (btns.length) comps.push({ type: "BUTTONS", buttons: btns });
+
+  // ---- CAROUSEL (optional): up to 10 cards, each with a media header + body + buttons ----
+  // Meta requires every card in a carousel to have the SAME structure (same header format,
+  // same number/type of buttons). We pass the cards through; the UI enforces consistency.
+  if (Array.isArray(body.cards) && body.cards.length) {
+    const cards = body.cards.map((card, idx) => {
+      const cardComps = [];
+      const chFmt = String(card.header_type || "image").toUpperCase();
+      const ch = { type: "HEADER", format: chFmt };
+      if (card.header_handle) ch.example = { header_handle: [card.header_handle] };
+      cardComps.push(ch);
+      const cb = { type: "BODY", text: card.body_text || "" };
+      if (Array.isArray(card.body_example) && card.body_example.length) cb.example = { body_text: [card.body_example] };
+      cardComps.push(cb);
+      const cbtns = buildButtonsArray(card.buttons || []);
+      if (cbtns.length) cardComps.push({ type: "BUTTONS", buttons: cbtns });
+      return { card_index: idx, components: cardComps };
+    });
+    comps.push({ type: "CAROUSEL", cards });
+  }
+
+  return comps;
+}
+
+// Shared button builder (used by main template + each carousel card)
+function buildButtonsArray(list) {
   const btns = [];
-  for (const b of (body.buttons || [])) {
+  for (const b of (list || [])) {
     const type = String(b.type || "").toUpperCase();
     if (type === "QUICK_REPLY") btns.push({ type: "QUICK_REPLY", text: b.text || "" });
     else if (type === "URL") {
       const ub = { type: "URL", text: b.text || "", url: b.url || "" };
-      if (Array.isArray(b.example) && b.example.length) ub.example = b.example; // for dynamic {{1}} url suffix
+      if (Array.isArray(b.example) && b.example.length) ub.example = b.example;
       btns.push(ub);
     } else if (type === "PHONE_NUMBER") btns.push({ type: "PHONE_NUMBER", text: b.text || "", phone_number: b.phone_number || "" });
+    else if (type === "COPY_CODE") btns.push({ type: "COPY_CODE", example: b.example || b.text || "" });
   }
-  if (btns.length) comps.push({ type: "BUTTONS", buttons: btns });
-
-  return comps;
+  return btns;
 }
 
 // GET small meta helper (waba id, phone, language list) for the create form
