@@ -742,3 +742,217 @@ async function start() {
   app.listen(PORT, () => console.log(`ChatsSync bot engine listening on port ${PORT} | uploads: ${UPLOAD_DIR}`));
 }
 start().catch((e) => { console.error("Startup error:", e.message); process.exit(1); });
+// ===================== WHATSAPP TEMPLATES (Meta WABA) =====================
+// Per-account: pulls each account's WABA id + token from Chatwoot (api/db), then talks to Meta Graph API.
+// Endpoints (called by the Chatwoot "Templates" sidebar tab):
+//   GET    /api/templates?account_id=&inbox_id=        -> list templates (live from Meta)
+//   POST   /api/templates  {account_id, inbox_id, ...}  -> create/submit a template to Meta
+//   DELETE /api/templates?account_id=&inbox_id=&name=   -> delete a template by name
+//   GET    /api/templates/meta?account_id=&inbox_id=    -> {waba_id, phone, languages} small helper for the form
+const WA_TPL_VER = process.env.WA_GRAPH_VERSION || "v21.0";
+
+// Reuse getWaCreds() but also return the WABA (business_account_id). We re-read provider_config
+// the same way getWaCreds does, so templates work for every account with no extra env.
+const wabaCache = new Map();
+async function getWabaCreds(a, inboxId) {
+  // fall back to the FIRST whatsapp inbox of the account if none provided
+  if (!inboxId) {
+    try {
+      const r = await cw.get(`${CHATWOOT_BASE_URL}/api/v1/accounts/${a}/inboxes`, { headers: { api_access_token: ADMIN_TOKEN } });
+      const wa = (r.data?.payload || []).find((i) => i.channel_type === "Channel::Whatsapp");
+      if (wa) inboxId = wa.id;
+    } catch (e) {}
+  }
+  if (!inboxId) return null;
+  const key = `${a}:${inboxId}`;
+  const hit = wabaCache.get(key); if (hit && hit.exp > Date.now()) return hit.creds;
+  let creds = null;
+  // 1) Chatwoot API (inbox provider_config)
+  try {
+    const r = await cw.get(`${CHATWOOT_BASE_URL}/api/v1/accounts/${a}/inboxes/${inboxId}`, { headers: { api_access_token: ADMIN_TOKEN } });
+    const d = r.data || {}; const pc = d.provider_config || (d.channel && d.channel.provider_config) || {};
+    const token = pc.api_key || pc.access_token; const phoneId = pc.phone_number_id; const waba = pc.business_account_id;
+    const phone = d.phone_number || (d.channel && d.channel.phone_number) || "";
+    if (token && waba) creds = { token, phoneId, waba, phone, src: "api" };
+  } catch (e) {}
+  // 2) Chatwoot DB (reliable) — if CHATWOOT_DB_URL is set
+  const db = await getChatwootDb();
+  if (!creds && db) {
+    try {
+      const q = await db.query("SELECT cw.provider_config AS pc, cw.phone_number AS phone FROM channel_whatsapp cw JOIN inboxes i ON i.channel_id = cw.id WHERE i.id = $1 AND i.channel_type = 'Channel::Whatsapp' LIMIT 1", [inboxId]);
+      const pc = (q.rows[0] && q.rows[0].pc) || {}; const phone = (q.rows[0] && q.rows[0].phone) || "";
+      const token = pc.api_key || pc.access_token; const phoneId = pc.phone_number_id; const waba = pc.business_account_id;
+      if (token && waba) creds = { token, phoneId, waba, phone, src: "db" };
+    } catch (e) { console.error("wabaCreds DB FAIL", e.message); }
+  }
+  wabaCache.set(key, { creds, exp: Date.now() + (creds ? 300000 : 60000) });
+  console.log("getWabaCreds", key, creds ? ("OK via " + creds.src + " waba=" + creds.waba) : "none");
+  return creds;
+}
+
+// Build Meta "components" array from the form payload our UI sends.
+function buildTemplateComponents(body) {
+  const comps = [];
+  const cat = String(body.category || "MARKETING").toUpperCase();
+
+  // ---- AUTHENTICATION templates have a fixed shape (body/footer/button are auto) ----
+  if (cat === "AUTHENTICATION") {
+    const addSecurity = body.add_security_recommendation !== false;
+    comps.push({ type: "BODY", add_security_recommendation: addSecurity });
+    if (body.code_expiration_minutes) comps.push({ type: "FOOTER", code_expiration_minutes: parseInt(body.code_expiration_minutes, 10) });
+    comps.push({ type: "BUTTONS", buttons: [{ type: "OTP", otp_type: "COPY_CODE", text: body.button_text || "Copy Code" }] });
+    return comps;
+  }
+
+  // ---- HEADER (optional) ----
+  const ht = String(body.header_type || "none").toLowerCase();
+  if (ht === "text" && (body.header_text || "").trim()) {
+    const h = { type: "HEADER", format: "TEXT", text: body.header_text.trim() };
+    if (Array.isArray(body.header_example) && body.header_example.length) h.example = { header_text: body.header_example };
+    comps.push(h);
+  } else if (["image", "video", "document"].includes(ht)) {
+    const h = { type: "HEADER", format: ht.toUpperCase() };
+    if (body.header_handle) h.example = { header_handle: [body.header_handle] }; // media sample handle (from resumable upload)
+    comps.push(h);
+  } else if (ht === "location") {
+    comps.push({ type: "HEADER", format: "LOCATION" });
+  }
+
+  // ---- BODY (required) ----
+  const bodyComp = { type: "BODY", text: body.body_text || "" };
+  if (Array.isArray(body.body_example) && body.body_example.length) bodyComp.example = { body_text: [body.body_example] };
+  comps.push(bodyComp);
+
+  // ---- FOOTER (optional) ----
+  if ((body.footer_text || "").trim()) comps.push({ type: "FOOTER", text: body.footer_text.trim() });
+
+  // ---- BUTTONS (optional): quick replies + url + phone ----
+  const btns = [];
+  for (const b of (body.buttons || [])) {
+    const type = String(b.type || "").toUpperCase();
+    if (type === "QUICK_REPLY") btns.push({ type: "QUICK_REPLY", text: b.text || "" });
+    else if (type === "URL") {
+      const ub = { type: "URL", text: b.text || "", url: b.url || "" };
+      if (Array.isArray(b.example) && b.example.length) ub.example = b.example; // for dynamic {{1}} url suffix
+      btns.push(ub);
+    } else if (type === "PHONE_NUMBER") btns.push({ type: "PHONE_NUMBER", text: b.text || "", phone_number: b.phone_number || "" });
+  }
+  if (btns.length) comps.push({ type: "BUTTONS", buttons: btns });
+
+  return comps;
+}
+
+// GET small meta helper (waba id, phone, language list) for the create form
+app.get("/api/templates/meta", async (req, res) => {
+  try {
+    const a = parseInt(req.query.account_id, 10);
+    const inboxId = req.query.inbox_id ? parseInt(req.query.inbox_id, 10) : null;
+    if (!a) return res.status(400).json({ error: "account_id required" });
+    const creds = await getWabaCreds(a, inboxId);
+    if (!creds) return res.status(404).json({ error: "No WhatsApp Cloud inbox / WABA found for this account" });
+    res.json({ ok: true, waba_id: creds.waba, phone: creds.phone || null });
+  } catch (e) { console.error("GET /api/templates/meta", e.message); res.status(500).json({ error: e.message }); }
+});
+
+// GET list templates (live from Meta)
+app.get("/api/templates", async (req, res) => {
+  try {
+    const a = parseInt(req.query.account_id, 10);
+    const inboxId = req.query.inbox_id ? parseInt(req.query.inbox_id, 10) : null;
+    if (!a) return res.status(400).json({ error: "account_id required" });
+    const creds = await getWabaCreds(a, inboxId);
+    if (!creds) return res.status(404).json({ error: "No WhatsApp Cloud inbox / WABA found for this account" });
+    const fields = "name,status,category,language,components,quality_score,id,rejected_reason";
+    const url = `https://graph.facebook.com/${WA_TPL_VER}/${creds.waba}/message_templates?fields=${fields}&limit=200`;
+    const r = await cw.get(url, { headers: { Authorization: `Bearer ${creds.token}` }, timeout: 20000 });
+    res.json({ ok: true, templates: r.data?.data || [], paging: r.data?.paging || null });
+  } catch (e) {
+    const meta = e.response?.data?.error;
+    console.error("GET /api/templates", meta || e.message);
+    res.status(e.response?.status || 500).json({ error: meta?.message || e.message, meta });
+  }
+});
+
+// POST create/submit a template
+app.post("/api/templates", async (req, res) => {
+  try {
+    const b = req.body || {};
+    const a = parseInt(b.account_id, 10);
+    const inboxId = b.inbox_id ? parseInt(b.inbox_id, 10) : null;
+    if (!a) return res.status(400).json({ error: "account_id required" });
+    if (!b.name || !b.language || !b.category) return res.status(400).json({ error: "name, language, category required" });
+    const creds = await getWabaCreds(a, inboxId);
+    if (!creds) return res.status(404).json({ error: "No WhatsApp Cloud inbox / WABA found for this account" });
+
+    const payload = {
+      name: String(b.name).toLowerCase().replace(/[^a-z0-9_]/g, "_").slice(0, 512),
+      language: b.language,
+      category: String(b.category).toUpperCase(),
+      components: buildTemplateComponents(b),
+    };
+    if (b.allow_category_change !== false) payload.allow_category_change = true;
+
+    const url = `https://graph.facebook.com/${WA_TPL_VER}/${creds.waba}/message_templates`;
+    const r = await cw.post(url, payload, { headers: { Authorization: `Bearer ${creds.token}`, "Content-Type": "application/json" }, timeout: 25000 });
+    console.log("template created", payload.name, "->", JSON.stringify(r.data));
+    res.json({ ok: true, template: r.data });
+  } catch (e) {
+    const meta = e.response?.data?.error;
+    console.error("POST /api/templates", meta || e.message);
+    res.status(e.response?.status || 500).json({ error: meta?.error_user_msg || meta?.message || e.message, meta });
+  }
+});
+
+// DELETE a template by name (Meta deletes ALL languages of that name)
+app.delete("/api/templates", async (req, res) => {
+  try {
+    const a = parseInt(req.query.account_id, 10);
+    const inboxId = req.query.inbox_id ? parseInt(req.query.inbox_id, 10) : null;
+    const name = (req.query.name || "").trim();
+    if (!a || !name) return res.status(400).json({ error: "account_id and name required" });
+    const creds = await getWabaCreds(a, inboxId);
+    if (!creds) return res.status(404).json({ error: "No WhatsApp Cloud inbox / WABA found for this account" });
+    const url = `https://graph.facebook.com/${WA_TPL_VER}/${creds.waba}/message_templates?name=${encodeURIComponent(name)}`;
+    const r = await cw.delete(url, { headers: { Authorization: `Bearer ${creds.token}` }, timeout: 20000 });
+    res.json({ ok: true, result: r.data });
+  } catch (e) {
+    const meta = e.response?.data?.error;
+    console.error("DELETE /api/templates", meta || e.message);
+    res.status(e.response?.status || 500).json({ error: meta?.message || e.message, meta });
+  }
+});
+
+// POST media upload for template HEADER samples (image/video/document) -> returns a header_handle.
+// Meta needs a sample media "handle" from the resumable upload API for media-header templates.
+app.post("/api/templates/upload-media", upload.single("file"), async (req, res) => {
+  try {
+    const b = req.body || {};
+    const a = parseInt(b.account_id, 10);
+    const inboxId = b.inbox_id ? parseInt(b.inbox_id, 10) : null;
+    if (!a) return res.status(400).json({ error: "account_id required" });
+    if (!req.file) return res.status(400).json({ error: "file required" });
+    const creds = await getWabaCreds(a, inboxId);
+    if (!creds) return res.status(404).json({ error: "No WhatsApp Cloud inbox / WABA found for this account" });
+    // App ID is needed for the resumable upload session. Try env, else derive is not possible -> require env.
+    const APP_ID = process.env.META_APP_ID || "";
+    if (!APP_ID) { try { fs.unlinkSync(req.file.path); } catch {} return res.status(400).json({ error: "META_APP_ID env not set (needed for media-header templates). Text/none headers work without it." }); }
+    const fileBuf = fs.readFileSync(req.file.path);
+    const fileLen = fileBuf.length; const fileType = req.file.mimetype || "application/octet-stream";
+    // 1) start a resumable upload session
+    const startUrl = `https://graph.facebook.com/${WA_TPL_VER}/${APP_ID}/uploads?file_length=${fileLen}&file_type=${encodeURIComponent(fileType)}&access_token=${creds.token}`;
+    const s = await cw.post(startUrl, {}, { timeout: 20000 });
+    const sessionId = s.data?.id; // upload:XXXX
+    // 2) upload the bytes
+    const u = await cw.post(`https://graph.facebook.com/${WA_TPL_VER}/${sessionId}`, fileBuf,
+      { headers: { Authorization: `OAuth ${creds.token}`, file_offset: "0", "Content-Type": "application/octet-stream" }, maxBodyLength: Infinity, timeout: 60000 });
+    const handle = u.data?.h;
+    try { fs.unlinkSync(req.file.path); } catch {}
+    if (!handle) return res.status(500).json({ error: "no handle returned from Meta upload" });
+    res.json({ ok: true, handle });
+  } catch (e) {
+    const meta = e.response?.data?.error;
+    console.error("POST /api/templates/upload-media", meta || e.message);
+    res.status(e.response?.status || 500).json({ error: meta?.message || e.message, meta });
+  }
+});
+// ===================== END WHATSAPP TEMPLATES =====================
