@@ -865,9 +865,26 @@ function buildButtonsArray(list) {
       btns.push(ub);
     } else if (type === "PHONE_NUMBER") btns.push({ type: "PHONE_NUMBER", text: b.text || "", phone_number: b.phone_number || "" });
     else if (type === "COPY_CODE") btns.push({ type: "COPY_CODE", example: b.example || b.text || "" });
+    else if (type === "FLOW") { const fb = { type: "FLOW", text: b.text || "", flow_action: b.flow_action || "navigate" }; if (b.flow_id) fb.flow_id = b.flow_id; if (b.navigate_screen) fb.navigate_screen = b.navigate_screen; btns.push(fb); }
   }
   return btns;
 }
+
+// List ALL WhatsApp Cloud numbers of an account (each with its own WABA) for the dashboard picker
+app.get("/api/templates/numbers", async (req, res) => {
+  try {
+    const a = parseInt(req.query.account_id, 10);
+    if (!a) return res.status(400).json({ error: "account_id required" });
+    const r = await cw.get(`${CHATWOOT_BASE_URL}/api/v1/accounts/${a}/inboxes`, { headers: { api_access_token: ADMIN_TOKEN } });
+    const waInboxes = (r.data?.payload || []).filter((i) => i.channel_type === "Channel::Whatsapp");
+    const numbers = [];
+    for (const inb of waInboxes) {
+      const creds = await getWabaCreds(a, inb.id);
+      numbers.push({ inbox_id: inb.id, name: inb.name, phone: inb.phone_number || creds?.phone || null, waba_id: creds?.waba || null, ready: !!(creds && creds.waba) });
+    }
+    res.json({ ok: true, numbers });
+  } catch (e) { console.error("GET /api/templates/numbers", e.response?.data || e.message); res.status(500).json({ error: e.message }); }
+}); 
 
 // GET small meta helper (waba id, phone, language list) for the create form
 app.get("/api/templates/meta", async (req, res) => {
