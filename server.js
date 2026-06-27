@@ -98,7 +98,47 @@ app.use((req, res, next) => {
   if (req.method === "OPTIONS") return res.sendStatus(200);
   next();
 });
-
+// ===================== AUTH: protect /api with the user's Chatwoot session =====================
+// Every builder/gallery/templates request must carry the logged-in user's Chatwoot
+// access token (?token=...). We verify it with Chatwoot and confirm the user really
+// belongs to the account/resource being touched. Blocks cross-account access.
+const _authCache = new Map(); // token -> { accounts:Set<number>, exp:number }
+async function accountsForToken(token) {
+  if (!token) return null;
+  const hit = _authCache.get(token);
+  if (hit && Date.now() < hit.exp) return hit.accounts;
+  try {
+    const r = await cw.get(`${CHATWOOT_BASE_URL}/api/v1/profile`, { headers: { api_access_token: token }, timeout: 8000 });
+    const list = (r.data && Array.isArray(r.data.accounts)) ? r.data.accounts : [];
+    const accounts = new Set(list.map((a) => parseInt(a.id, 10)).filter((n) => Number.isFinite(n)));
+    _authCache.set(token, { accounts, exp: Date.now() + 60000 });
+    return accounts;
+  } catch (e) { return null; }
+}
+function csToken(req) {
+  return (req.query && req.query.token) || req.headers["x-cs-token"] || (req.headers.authorization || "").replace(/^Bearer\s+/i, "") || "";
+}
+async function requireAuth(req, res, next) {
+  if (!req.path.startsWith("/api/")) return next();
+  try {
+    const accounts = await accountsForToken(csToken(req));
+    if (!accounts || accounts.size === 0) return res.status(401).json({ error: "Please sign in to ChatsSync to continue." });
+    const claims = [];
+    if (req.query && req.query.account_id != null) claims.push(parseInt(req.query.account_id, 10));
+    if (req.body && req.body.account_id != null) claims.push(parseInt(req.body.account_id, 10));
+    try {
+      const mF = req.path.match(/^\/api\/flows\/(\d+)/);
+      const mM = req.path.match(/^\/api\/media\/(\d+)/);
+      if (mF) { const row = await getFlowById(parseInt(mF[1], 10)); if (row && row.account_id != null) claims.push(parseInt(row.account_id, 10)); }
+      else if (mM) { const row = await getMedia(parseInt(mM[1], 10)); if (row && row.account_id != null) claims.push(parseInt(row.account_id, 10)); }
+    } catch (e) {}
+    for (const c of claims) { if (!Number.isFinite(c) || !accounts.has(c)) return res.status(403).json({ error: "You don't have access to this account." }); }
+    req.csAccounts = accounts;
+    next();
+  } catch (e) { return res.status(401).json({ error: "Authentication failed." }); }
+}
+app.use(requireAuth);
+// ================================================================================================
 // uploaded files publicly serve
 app.use("/uploads", express.static(UPLOAD_DIR));
 
