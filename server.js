@@ -192,6 +192,16 @@ async function sendText(a, c, text) { if (!text) return; try { await apiPost(`/a
 // Chatwoot turns input_select into WhatsApp interactive buttons (<=3 items) or a list (>3 items)
 async function sendOptions(a, c, text, titles) { try { await apiPost(`/api/v1/accounts/${a}/conversations/${c}/messages`, { content: text || " ", message_type: "outgoing", content_type: "input_select", content_attributes: { items: (titles || []).map((t) => ({ title: t, value: t })) } }); } catch (e) { console.error("sendOptions", e.response?.data || e.message); } }
 
+// Send one form field to the customer. Text field -> a plain question. List/Buttons field -> a tappable interactive menu.
+async function sendFormField(a, c, field) {
+  const type = (field && field.type) || "text";
+  if ((type === "list" || type === "buttons") && Array.isArray(field.options) && field.options.length) {
+    const titles = field.options.map((o) => (o && o.title ? String(o.title) : "")).filter(Boolean);
+    if (titles.length) { await sendOptions(a, c, field.label || "Please choose:", titles); return; }
+  }
+  await sendText(a, c, field.label || "");
+}
+
 // ===== Native WhatsApp Cloud interactive (real CTA button / list descriptions / footer) =====
 const convCache = new Map();
 async function getConvInfo(a, c) {
@@ -545,7 +555,7 @@ async function runFlow(a, c, s, def) {
       const ff = (node.fields || []).filter((fd) => (fd.label || "").trim());
       if (!ff.length) { nextsOf(node).forEach((x) => queue.push(x)); continue; }
       s.variables.__form_idx = 0; s.variables.__form_answers = {};
-      await sendText(a, c, ff[0].label);
+      await sendFormField(a, c, ff[0]); // text -> question, list/buttons -> interactive menu
       awaitNode = { type: "form", nodeId: id };
       continue;
     }
@@ -737,7 +747,7 @@ app.post("/webhook", async (req, res) => {
       const cur = ff[fidx];
       if (cur) { const k = cur.key || ("field_" + (fidx + 1)); fans[k] = text; s.variables[k] = text; }
       fidx++; s.variables.__form_answers = fans; s.variables.__form_idx = fidx;
-      if (fidx < ff.length) { await sendText(accountId, conversationId, substVars(ff[fidx].label, s.variables)); await saveSession(accountId, conversationId, s); return; }
+      if (fidx < ff.length) { await sendFormField(accountId, conversationId, { ...ff[fidx], label: substVars(ff[fidx].label, s.variables) }); await saveSession(accountId, conversationId, s); return; }
       const summary = "📋 *Form submitted:*\n" + ff.map((fd, i) => `• ${fd.key || ("field_" + (i + 1))}: ${fans[fd.key || ("field_" + (i + 1))] || "-"}`).join("\n");
       await sendText(accountId, conversationId, summary);
       if (fnode && fnode.submit_message) await sendText(accountId, conversationId, fnode.submit_message);
