@@ -190,7 +190,8 @@ async function apiPost(path2, body) {
 }
 async function sendText(a, c, text) { if (!text) return; try { await apiPost(`/api/v1/accounts/${a}/conversations/${c}/messages`, { content: text, message_type: "outgoing" }); } catch (e) { console.error("sendText", e.response?.data || e.message); } }
 // Chatwoot turns input_select into WhatsApp interactive buttons (<=3 items) or a list (>3 items)
-async function sendOptions(a, c, text, titles) { try { await apiPost(`/api/v1/accounts/${a}/conversations/${c}/messages`, { content: text || " ", message_type: "outgoing", content_type: "input_select", content_attributes: { items: (titles || []).map((t) => ({ title: t, value: t })) } }); } catch (e) { console.error("sendOptions", e.response?.data || e.message); } }
+// WhatsApp limits: button titles 20 chars, list row titles 24 chars — clip so sends never silently fail.
+async function sendOptions(a, c, text, titles) { try { const tl = titles || []; const maxLen = tl.length <= 3 ? 20 : 24; await apiPost(`/api/v1/accounts/${a}/conversations/${c}/messages`, { content: text || " ", message_type: "outgoing", content_type: "input_select", content_attributes: { items: tl.map((t) => { const tt = String(t).slice(0, maxLen); return { title: tt, value: tt }; }) } }); } catch (e) { console.error("sendOptions", e.response?.data || e.message); } }
 
 // Send one form field to the customer. Text field -> a plain question. List/Buttons field -> a tappable interactive menu.
 async function sendFormField(a, c, field) {
@@ -203,27 +204,37 @@ async function sendFormField(a, c, field) {
 }
 
 // ===== Product Cart (catalog) helpers =====
-// Show all products as a tappable list. Each product's label carries its index so we can map the tap back.
 function catProductTitle(p) { return `${p.name}${p.price ? " — Rs " + p.price : ""}`; }
+// Products go out as a numbered TEXT message (no WhatsApp list limit — 20, 50 products all fine).
+// The customer just types the number (FAQ/keyword style).
 async function sendCatalogProducts(a, c, prods) {
-  const titles = prods.map((p) => catProductTitle(p));
-  await sendOptions(a, c, "🛍️ Select a product:", titles);
+  const lines = prods.map((p, i) => `*${i + 1}.* ${p.name}${p.price ? " — Rs " + p.price : ""}${p.desc ? "\n     _" + p.desc + "_" : ""}`);
+  const msg = "🛍️ *Hamare Products:*\n\n" + lines.join("\n") + "\n\n👉 Order karne ke liye product ka *number* likhein (e.g. 1)";
+  await sendText(a, c, msg);
 }
-// After a product is picked, ask quantity via buttons (1,2,3…)
+// After a product is picked, ask quantity via tappable options (typed numbers also accepted)
 async function sendCatalogQty(a, c, node, prod) {
-  const qtys = (node.qty_options && node.qty_options.length ? node.qty_options : ["1", "2", "3", "4", "5"]).map((x) => String(x));
-  await sendOptions(a, c, `How many *${prod.name}*?`, qtys);
+  const qtys = (node.qty_options && node.qty_options.length ? node.qty_options : ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]).map((x) => String(x)).slice(0, 10);
+  await sendOptions(a, c, `*${prod.name}* — kitne chahiye?`, qtys);
 }
-// After an item is added, offer add-more / checkout
+// After an item is added, offer add-more / checkout (WhatsApp button titles max 20 chars!)
 async function sendCatalogMore(a, c, node) {
-  const addL = node.add_more_label || "➕ Add more";
-  const coL = node.checkout_label || "✅ Checkout";
-  await sendOptions(a, c, "What next?", [addL, coL]);
+  const addL = (node.add_more_label || "➕ Add more").slice(0, 20);
+  const coL = (node.checkout_label || "✅ Confirm").slice(0, 20);
+  await sendOptions(a, c, "Aur kuch?", [addL, coL]);
 }
 function cartTotal(cart) { return (cart || []).reduce((s, it) => s + (Number(it.price) || 0) * (Number(it.qty) || 0), 0); }
-function cartSummaryText(cart) {
-  const lines = (cart || []).map((it) => `• ${it.name} x${it.qty} — Rs ${(Number(it.price) || 0) * (Number(it.qty) || 0)}`);
-  return lines.join("\n") + `\n\n*Total: Rs ${cartTotal(cart)}*`;
+function cartLines(cart) { return (cart || []).map((it) => `• ${it.name} x${it.qty} — Rs ${(Number(it.price) || 0) * (Number(it.qty) || 0)}`).join("\n"); }
+function cartSummaryText(cart) { return cartLines(cart) + `\n\n*Total: Rs ${cartTotal(cart)}*`; }
+// Cart status message after each add — shows EVERY item so far + running total
+function buildCartMsg(cnode, cart, prod, qty, lineTotal) {
+  const tmpl = (cnode && cnode.cart_line && cnode.cart_line.trim()) ? cnode.cart_line : "🛒 *Aapka cart:*\n{{cart}}\n\n*Total: Rs {{cartTotal}}*";
+  return tmpl
+    .replace(/\{\{\s*cart\s*\}\}/g, cartLines(cart))
+    .replace(/\{\{\s*item\s*\}\}/g, prod.name)
+    .replace(/\{\{\s*qty\s*\}\}/g, String(qty))
+    .replace(/\{\{\s*lineTotal\s*\}\}/g, String(lineTotal))
+    .replace(/\{\{\s*cartTotal\s*\}\}/g, String(cartTotal(cart)));
 }
 // Post the full order (items + total + answers), run submit message + sheet, then advance the flow.
 async function finishCatalogOrder(a, c, s, def, cnode, cart, fans) {
@@ -823,13 +834,16 @@ app.post("/webhook", async (req, res) => {
       const prods = ((cnode && cnode.products) || []).filter((p) => (p.name || "").trim());
       const cart = s.variables.__cart || [];
       const stage = s.variables.__cat_stage || "pick";
-      const addL = (cnode && cnode.add_more_label) || "➕ Add more";
-      const coL = (cnode && cnode.checkout_label) || "✅ Checkout";
+      const addL = ((cnode && cnode.add_more_label) || "➕ Add more").slice(0, 20);
+      const coL = ((cnode && cnode.checkout_label) || "✅ Confirm").slice(0, 20);
       const t = (text || "").trim();
 
-      // STAGE 1: picking a product from the list
+      // STAGE 1: picking a product — customer TYPES the number (1, 2, 3…) or the name
       if (stage === "pick") {
-        const idx = prods.findIndex((p) => catProductTitle(p) === t || (p.name || "").trim() === t);
+        let idx = -1;
+        const num = parseInt(t.replace(/[^\d]/g, ""), 10);
+        if (num >= 1 && num <= prods.length && String(num) === t.replace(/[^\d]/g, "")) idx = num - 1;
+        if (idx < 0) idx = prods.findIndex((p) => catProductTitle(p) === t || (p.name || "").trim().toLowerCase() === t.toLowerCase());
         if (idx < 0) { await sendCatalogProducts(accountId, conversationId, prods); await saveSession(accountId, conversationId, s); return; }
         s.variables.__cat_pick = idx; s.variables.__cat_stage = "qty";
         await sendCatalogQty(accountId, conversationId, cnode, prods[idx]);
@@ -843,11 +857,12 @@ app.post("/webhook", async (req, res) => {
         const prod = prods[pIdx];
         if (!prod || !qty || qty < 1) { if (prod) await sendCatalogQty(accountId, conversationId, cnode, prod); await saveSession(accountId, conversationId, s); return; }
         const lineTotal = (Number(prod.price) || 0) * qty;
-        cart.push({ name: prod.name, price: Number(prod.price) || 0, qty });
+        // same product again? merge quantities instead of duplicate lines
+        const existing = cart.find((it) => it.name === prod.name);
+        if (existing) existing.qty = (Number(existing.qty) || 0) + qty;
+        else cart.push({ name: prod.name, price: Number(prod.price) || 0, qty });
         s.variables.__cart = cart;
-        const tmpl = (cnode && cnode.cart_line && cnode.cart_line.trim()) ? cnode.cart_line : "✅ {{item}} x{{qty}} (Rs {{lineTotal}}) added.\nTotal so far: Rs {{cartTotal}}";
-        const msg = tmpl.replace(/\{\{\s*item\s*\}\}/g, prod.name).replace(/\{\{\s*qty\s*\}\}/g, String(qty)).replace(/\{\{\s*lineTotal\s*\}\}/g, String(lineTotal)).replace(/\{\{\s*cartTotal\s*\}\}/g, String(cartTotal(cart)));
-        await sendText(accountId, conversationId, msg);
+        await sendText(accountId, conversationId, buildCartMsg(cnode, cart, prod, qty, lineTotal));
         s.variables.__cat_stage = "more";
         await sendCatalogMore(accountId, conversationId, cnode);
         await saveSession(accountId, conversationId, s); return;
