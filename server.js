@@ -202,6 +202,48 @@ async function sendFormField(a, c, field) {
   await sendText(a, c, field.label || "");
 }
 
+// ===== Product Cart (catalog) helpers =====
+// Show all products as a tappable list. Each product's label carries its index so we can map the tap back.
+function catProductTitle(p) { return `${p.name}${p.price ? " — Rs " + p.price : ""}`; }
+async function sendCatalogProducts(a, c, prods) {
+  const titles = prods.map((p) => catProductTitle(p));
+  await sendOptions(a, c, "🛍️ Select a product:", titles);
+}
+// After a product is picked, ask quantity via buttons (1,2,3…)
+async function sendCatalogQty(a, c, node, prod) {
+  const qtys = (node.qty_options && node.qty_options.length ? node.qty_options : ["1", "2", "3", "4", "5"]).map((x) => String(x));
+  await sendOptions(a, c, `How many *${prod.name}*?`, qtys);
+}
+// After an item is added, offer add-more / checkout
+async function sendCatalogMore(a, c, node) {
+  const addL = node.add_more_label || "➕ Add more";
+  const coL = node.checkout_label || "✅ Checkout";
+  await sendOptions(a, c, "What next?", [addL, coL]);
+}
+function cartTotal(cart) { return (cart || []).reduce((s, it) => s + (Number(it.price) || 0) * (Number(it.qty) || 0), 0); }
+function cartSummaryText(cart) {
+  const lines = (cart || []).map((it) => `• ${it.name} x${it.qty} — Rs ${(Number(it.price) || 0) * (Number(it.qty) || 0)}`);
+  return lines.join("\n") + `\n\n*Total: Rs ${cartTotal(cart)}*`;
+}
+// Post the full order (items + total + answers), run submit message + sheet, then advance the flow.
+async function finishCatalogOrder(a, c, s, def, cnode, cart, fans) {
+  const summary = "🧾 *Order Summary*\n" + cartSummaryText(cart) +
+    (Object.keys(fans || {}).length ? "\n\n" + Object.entries(fans).map(([k, v]) => `• ${k}: ${v}`).join("\n") : "");
+  await sendText(a, c, summary);
+  if (cnode && cnode.submit_message) await sendText(a, c, cnode.submit_message);
+  if (cnode && cnode.sheet_url) {
+    try {
+      const _ci = await getConvInfo(a, c);
+      const itemsStr = (cart || []).map((it) => `${it.name} x${it.qty}`).join(", ");
+      await appendToSheet(cnode.sheet_url, { Time: new Date().toLocaleString(), Phone: (_ci && _ci.number) || "", Order: itemsStr, Total: cartTotal(cart), ...fans });
+    } catch (e) {}
+  }
+  delete s.variables.__cart; delete s.variables.__cat_stage; delete s.variables.__cat_pick;
+  delete s.variables.__form_idx; delete s.variables.__form_answers;
+  s.awaiting = null; s.nodeId = (cnode && cnode.next) || null;
+  await advance(a, c, s, def);
+}
+
 // ===== Native WhatsApp Cloud interactive (real CTA button / list descriptions / footer) =====
 const convCache = new Map();
 async function getConvInfo(a, c) {
@@ -560,6 +602,18 @@ async function runFlow(a, c, s, def) {
       continue;
     }
 
+    if (node.type === "catalog") {
+      const prods = (node.products || []).filter((p) => (p.name || "").trim());
+      if (!prods.length) { nextsOf(node).forEach((x) => queue.push(x)); continue; }
+      if (node.intro) await sendText(a, c, node.intro);
+      s.variables.__cart = [];                 // cart lives in session; start fresh
+      s.variables.__cat_stage = "pick";        // pick -> qty -> more -> form
+      s.variables.__form_idx = 0; s.variables.__form_answers = {};
+      await sendCatalogProducts(a, c, prods);
+      awaitNode = { type: "catalog", nodeId: id };
+      continue;
+    }
+
     if (node.type === "question") {
       await sendText(a, c, node.text);
       s.variables.__q_token = Math.random().toString(36).slice(2);
@@ -691,6 +745,11 @@ app.post("/webhook", async (req, res) => {
       const choice = (submitted[0].value || submitted[0].title || "").trim();
       if (session) {
         const s = toSession(session, flowPublishedAt); s.variables.last_message = choice; s.variables.message = choice; s.variables.__inbox = inboxId; Object.assign(s.variables, senderVars);
+        // Catalog & form drive their own menus; let their message_created handlers process the tap instead of routing it here.
+        if (session.awaiting === "catalog" || session.awaiting === "form") {
+          if (!event.content || !event.content.trim()) { event.content = choice; event.event = "message_created"; event.message_type = "incoming"; }
+          else return;
+        } else {
         const mc = resolveMenuChoice(def, s, choice);
         if (mc) {
           const mNode = def.nodes[mc.menuId];
@@ -700,8 +759,9 @@ app.post("/webhook", async (req, res) => {
           const cur = def.nodes[s.nodeId];
           if (cur && cur.loop_menu) { s.awaiting = null; await advance(accountId, conversationId, s, def); }
         }
-      }
-      return;
+        return;
+        }
+      } else return;
     }
 
     if (event.event !== "message_created") return;
@@ -756,6 +816,78 @@ app.post("/webhook", async (req, res) => {
       s.awaiting = null; s.nodeId = (fnode && fnode.next) || null;
       await advance(accountId, conversationId, s, def);
       return;
+    }
+
+    if (session.awaiting === "catalog") {
+      const cnode = def.nodes[session.node_id];
+      const prods = ((cnode && cnode.products) || []).filter((p) => (p.name || "").trim());
+      const cart = s.variables.__cart || [];
+      const stage = s.variables.__cat_stage || "pick";
+      const addL = (cnode && cnode.add_more_label) || "➕ Add more";
+      const coL = (cnode && cnode.checkout_label) || "✅ Checkout";
+      const t = (text || "").trim();
+
+      // STAGE 1: picking a product from the list
+      if (stage === "pick") {
+        const idx = prods.findIndex((p) => catProductTitle(p) === t || (p.name || "").trim() === t);
+        if (idx < 0) { await sendCatalogProducts(accountId, conversationId, prods); await saveSession(accountId, conversationId, s); return; }
+        s.variables.__cat_pick = idx; s.variables.__cat_stage = "qty";
+        await sendCatalogQty(accountId, conversationId, cnode, prods[idx]);
+        await saveSession(accountId, conversationId, s); return;
+      }
+
+      // STAGE 2: choosing a quantity for the picked product
+      if (stage === "qty") {
+        const qty = parseInt(t.replace(/[^\d]/g, ""), 10);
+        const pIdx = s.variables.__cat_pick;
+        const prod = prods[pIdx];
+        if (!prod || !qty || qty < 1) { if (prod) await sendCatalogQty(accountId, conversationId, cnode, prod); await saveSession(accountId, conversationId, s); return; }
+        const lineTotal = (Number(prod.price) || 0) * qty;
+        cart.push({ name: prod.name, price: Number(prod.price) || 0, qty });
+        s.variables.__cart = cart;
+        const tmpl = (cnode && cnode.cart_line && cnode.cart_line.trim()) ? cnode.cart_line : "✅ {{item}} x{{qty}} (Rs {{lineTotal}}) added.\nTotal so far: Rs {{cartTotal}}";
+        const msg = tmpl.replace(/\{\{\s*item\s*\}\}/g, prod.name).replace(/\{\{\s*qty\s*\}\}/g, String(qty)).replace(/\{\{\s*lineTotal\s*\}\}/g, String(lineTotal)).replace(/\{\{\s*cartTotal\s*\}\}/g, String(cartTotal(cart)));
+        await sendText(accountId, conversationId, msg);
+        s.variables.__cat_stage = "more";
+        await sendCatalogMore(accountId, conversationId, cnode);
+        await saveSession(accountId, conversationId, s); return;
+      }
+
+      // STAGE 3: add more OR checkout
+      if (stage === "more") {
+        if (t === addL || /add|aur|more|zyada/i.test(t)) {
+          s.variables.__cat_stage = "pick";
+          await sendCatalogProducts(accountId, conversationId, prods);
+          await saveSession(accountId, conversationId, s); return;
+        }
+        if (t === coL || /check ?out|complete|done|order|confirm|ho ?gaya|bas/i.test(t)) {
+          // move to follow-up questions (reuse form fields)
+          const ff = ((cnode && cnode.fields) || []).filter((fd) => (fd.label || "").trim());
+          s.variables.__cat_stage = "form"; s.variables.__form_idx = 0; s.variables.__form_answers = {};
+          if (ff.length) { await sendFormField(accountId, conversationId, ff[0]); await saveSession(accountId, conversationId, s); return; }
+          // no questions -> finish right away
+          await finishCatalogOrder(accountId, conversationId, s, def, cnode, cart, {});
+          return;
+        }
+        // unrecognized -> re-show options
+        await sendCatalogMore(accountId, conversationId, cnode);
+        await saveSession(accountId, conversationId, s); return;
+      }
+
+      // STAGE 4: answering follow-up questions
+      if (stage === "form") {
+        const ff = ((cnode && cnode.fields) || []).filter((fd) => (fd.label || "").trim());
+        let fidx = s.variables.__form_idx || 0;
+        const fans = s.variables.__form_answers || {};
+        const cur = ff[fidx];
+        if (cur) { const k = cur.key || ("field_" + (fidx + 1)); fans[k] = t; s.variables[k] = t; }
+        fidx++; s.variables.__form_answers = fans; s.variables.__form_idx = fidx;
+        if (fidx < ff.length) { await sendFormField(accountId, conversationId, { ...ff[fidx], label: substVars(ff[fidx].label, s.variables) }); await saveSession(accountId, conversationId, s); return; }
+        await finishCatalogOrder(accountId, conversationId, s, def, cnode, cart, fans);
+        return;
+      }
+
+      await saveSession(accountId, conversationId, s); return;
     }
 
     // The reply may be a tap from the CURRENT menu OR any menu shown earlier in this chat -> route it
