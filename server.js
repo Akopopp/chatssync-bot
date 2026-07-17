@@ -13,7 +13,9 @@ import {
   initDb, seedFlowIfEmpty, getPublishedFlowForInbox, getSession, saveSession,
   listFlows, createFlow, getFlowById, saveFlowById, publishFlowById, unpublishFlowById, deleteFlowById, assignInbox,
   addMedia, listMedia, getMedia, deleteMedia,
+  getCalSettings, saveCalSettings,
 } from "./db.js";
+import { getSlots, createEvent } from "./calendar.js";
 
 const PORT = process.env.PORT || 3000;
 const CHATWOOT_BASE_URL = process.env.CHATWOOT_BASE_URL;
@@ -22,14 +24,11 @@ const ADMIN_TOKEN = process.env.CHATWOOT_API_TOKEN;
 const UPLOAD_DIR = process.env.UPLOAD_DIR || "/data/uploads";
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || "").replace(/\/$/, "");
 
-// Optional native WhatsApp Cloud: set WA_TOKEN + WA_PHONE_NUMBER_ID to send REAL interactive
-// (CTA url button, list row descriptions, native footer). If unset/any error -> falls back to Chatwoot.
 const WA_TOKEN = process.env.WA_TOKEN || "";
 const WA_PHONE_ID = process.env.WA_PHONE_NUMBER_ID || "";
 const WA_VER = process.env.WA_GRAPH_VERSION || "v21.0";
-const WA_ACCOUNT_ID = process.env.WA_ACCOUNT_ID || ""; // native only for this account (multi-account safety)
+const WA_ACCOUNT_ID = process.env.WA_ACCOUNT_ID || "";
 const waEnabled = !!(WA_TOKEN && WA_PHONE_ID);
-// Optional: Chatwoot DB (read-only) -> auto-fetch each account's WhatsApp creds for native (true multi-account, no per-number env)
 const CHATWOOT_DB_URL = process.env.CHATWOOT_DB_URL || "";
 let chatwootDb = null, chatwootDbTried = false;
 async function getChatwootDb() {
@@ -41,7 +40,6 @@ async function getChatwootDb() {
   return chatwootDb;
 }
 
-// ---- Google Sheets (optional): auto-save Form answers into a user's sheet (NO extra package) ----
 const GOOGLE_SA_JSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON || "";
 let _gTok = null, _gTokExp = 0;
 async function getGoogleToken() {
@@ -84,7 +82,6 @@ fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 const seedFlow = JSON.parse(fs.readFileSync("./flow.json", "utf-8"));
 
-// Reuse TCP/TLS connections to Chatwoot -> much faster replies on slow sslip.io https
 const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 50 });
 const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50 });
 const cw = axios.create({ httpAgent, httpsAgent, timeout: 20000 });
@@ -99,8 +96,13 @@ app.use((req, res, next) => {
   next();
 });
 
-// uploaded files publicly serve
 app.use("/uploads", express.static(UPLOAD_DIR));
+app.use(express.static("public"));
+app.get("/book", (req, res) => {
+  const f = path.join(process.cwd(), "public", "book.html");
+  if (fs.existsSync(f)) return res.sendFile(f);
+  res.status(404).send("Booking page not found. Create public/book.html");
+});
 
 app.get("/", (req, res) => res.send("ChatsSync bot engine is running"));
 const parseDef = (d) => (typeof d === "string" ? JSON.parse(d) : d);
@@ -110,7 +112,7 @@ const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, UPLOAD_DIR),
   filename: (req, file, cb) => { const ext = path.extname(file.originalname || ""); cb(null, "m" + Date.now() + "-" + Math.random().toString(36).slice(2, 8) + ext); },
 });
-const upload = multer({ storage, limits: { fileSize: 100 * 1024 * 1024 } }); // 100MB
+const upload = multer({ storage, limits: { fileSize: 100 * 1024 * 1024 } });
 function mediaType(mime) { if (!mime) return "document"; if (mime.startsWith("image/")) return "image"; if (mime.startsWith("video/")) return "video"; if (mime.startsWith("audio/")) return "audio"; return "document"; }
 function fileUrl(req, filename) { return PUBLIC_BASE_URL ? `${PUBLIC_BASE_URL}/uploads/${filename}` : `${req.protocol}://${req.get("host")}/uploads/${filename}`; }
 
@@ -135,7 +137,7 @@ app.delete("/api/media/:id", async (req, res) => {
 });
 
 // ===== MULTI-FLOW API =====
-const flowCache = new Map(); // account:inbox -> { row, exp }  (skips a DB hit per webhook)
+const flowCache = new Map();
 function clearFlowCache() { flowCache.clear(); }
 async function cachedPublishedFlow(accountId, inboxId) {
   const key = accountId + ":" + inboxId; const now = Date.now(); const c = flowCache.get(key);
@@ -154,6 +156,64 @@ app.post("/api/flows/:id/unpublish", async (req, res) => { try { const row = awa
 app.delete("/api/flows/:id", async (req, res) => { try { await deleteFlowById(parseInt(req.params.id, 10)); clearFlowCache(); res.json({ ok: true }); } catch (e) { res.status(500).json({ error: e.message }); } });
 app.post("/api/flows/:id/assign-inbox", async (req, res) => { try { const inboxId = (req.body || {}).inbox_id; const row = await assignInbox(parseInt(req.params.id, 10), inboxId != null ? parseInt(inboxId, 10) : null); if (!row) return res.status(404).json({ error: "not found" }); clearFlowCache(); res.json({ ok: true, flow: { id: row.id, inbox_id: row.inbox_id } }); } catch (e) { res.status(500).json({ error: e.message }); } });
 
+// ===== CALENDAR SETTINGS + BOOKING =====
+app.get("/api/calendar/settings", async (req, res) => {
+  try {
+    const accountId = parseInt(req.query.account_id, 10);
+    if (!accountId) return res.status(400).json({ error: "account_id required" });
+    const s = await getCalSettings(accountId);
+    let serviceEmail = "";
+    if (GOOGLE_SA_JSON) { try { serviceEmail = JSON.parse(GOOGLE_SA_JSON).client_email || ""; } catch {} }
+    res.json({ ok: true, settings: s || {}, service_email: serviceEmail });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.put("/api/calendar/settings", async (req, res) => {
+  try {
+    const { account_id, ...settings } = req.body || {};
+    const accountId = parseInt(account_id, 10);
+    if (!accountId) return res.status(400).json({ error: "account_id required" });
+    const row = await saveCalSettings(accountId, settings);
+    res.json({ ok: true, settings: row });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get("/api/calendar/slots", async (req, res) => {
+  try {
+    const accountId = parseInt(req.query.account_id, 10);
+    const date = req.query.date;
+    if (!accountId || !date) return res.status(400).json({ error: "account_id and date required" });
+    if (!GOOGLE_SA_JSON) return res.json({ ok: true, slots: [] });
+    const cfg = await getCalSettings(accountId);
+    if (!cfg || !cfg.calendar_id) return res.json({ ok: true, slots: [], error: "Calendar not configured" });
+    const slots = await getSlots(GOOGLE_SA_JSON, cfg.calendar_id, date, cfg);
+    res.json({ ok: true, slots });
+  } catch (e) { console.error("GET /api/calendar/slots", e.message); res.status(500).json({ error: e.message }); }
+});
+
+app.post("/api/calendar/book", async (req, res) => {
+  try {
+    const { account_id, conversation_id, date, time, name, notes } = req.body || {};
+    const accountId = parseInt(account_id, 10);
+    const convId = parseInt(conversation_id, 10);
+    if (!accountId || !convId || !date || !time || !name) return res.status(400).json({ error: "Missing required fields" });
+    if (!GOOGLE_SA_JSON) return res.status(400).json({ error: "Google Calendar not configured on server" });
+    const cfg = await getCalSettings(accountId);
+    if (!cfg || !cfg.calendar_id) return res.status(400).json({ error: "Calendar not set up. Please configure in ChatsSync chatbot builder." });
+    await createEvent(GOOGLE_SA_JSON, cfg.calendar_id, date, time, name, notes || "", cfg.apt_title || "Appointment", cfg.slot_duration || 30, cfg.timezone || "Asia/Karachi");
+    const [y, mo, d] = date.split("-");
+    const months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+    const dateLbl = `${d} ${months[parseInt(mo)-1]} ${y}`;
+    const [h, m] = time.split(":").map(Number);
+    const ap = h >= 12 ? "PM" : "AM";
+    const h12 = h === 0 ? 12 : h > 12 ? h - 12 : h;
+    const timeLbl = `${String(h12).padStart(2,"0")}:${String(m).padStart(2,"0")} ${ap}`;
+    const msg = `✅ *Appointment Confirmed!*\n\n👤 Name: ${name}\n📅 Date: ${dateLbl}\n⏰ Time: ${timeLbl}${notes ? "\n📝 Notes: " + notes : ""}\n\nHum aapka intezaar karenge! 🙌`;
+    await sendText(accountId, convId, msg);
+    res.json({ ok: true });
+  } catch (e) { console.error("POST /api/calendar/book", e.response?.data || e.message); res.status(500).json({ error: e.message || "Booking failed" }); }
+});
+
 app.get("/api/inboxes", async (req, res) => {
   try {
     const accountId = parseInt(req.query.account_id, 10);
@@ -164,7 +224,6 @@ app.get("/api/inboxes", async (req, res) => {
   } catch (e) { console.error("GET /api/inboxes", e.response?.data || e.message); res.status(500).json({ error: e.message }); }
 });
 
-// labels list (for the Update Tag node dropdown in the builder)
 app.get("/api/labels", async (req, res) => {
   try {
     const accountId = parseInt(req.query.account_id, 10);
@@ -189,11 +248,8 @@ async function apiPost(path2, body) {
   }
 }
 async function sendText(a, c, text) { if (!text) return; try { await apiPost(`/api/v1/accounts/${a}/conversations/${c}/messages`, { content: text, message_type: "outgoing" }); } catch (e) { console.error("sendText", e.response?.data || e.message); } }
-// Chatwoot turns input_select into WhatsApp interactive buttons (<=3 items) or a list (>3 items)
-// WhatsApp limits: button titles 20 chars, list row titles 24 chars — clip so sends never silently fail.
 async function sendOptions(a, c, text, titles) { try { const tl = titles || []; const maxLen = tl.length <= 3 ? 20 : 24; await apiPost(`/api/v1/accounts/${a}/conversations/${c}/messages`, { content: text || " ", message_type: "outgoing", content_type: "input_select", content_attributes: { items: tl.map((t) => { const tt = String(t).slice(0, maxLen); return { title: tt, value: tt }; }) } }); } catch (e) { console.error("sendOptions", e.response?.data || e.message); } }
 
-// Send one form field to the customer. Text field -> a plain question. List/Buttons field -> a tappable interactive menu.
 async function sendFormField(a, c, field) {
   const type = (field && field.type) || "text";
   if ((type === "list" || type === "buttons") && Array.isArray(field.options) && field.options.length) {
@@ -203,21 +259,16 @@ async function sendFormField(a, c, field) {
   await sendText(a, c, field.label || "");
 }
 
-// ===== Product Cart (catalog) helpers =====
 function catProductTitle(p) { return `${p.name}${p.price ? " — Rs " + p.price : ""}`; }
-// Products go out as a numbered TEXT message (no WhatsApp list limit — 20, 50 products all fine).
-// The customer just types the number (FAQ/keyword style).
 async function sendCatalogProducts(a, c, prods) {
   const lines = prods.map((p, i) => `*${i + 1}.* ${p.name}${p.price ? " — Rs " + p.price : ""}${p.desc ? "\n     _" + p.desc + "_" : ""}`);
   const msg = "🛍️ *Hamare Products:*\n\n" + lines.join("\n") + "\n\n👉 Order karne ke liye product ka *number* likhein (e.g. 1)";
   await sendText(a, c, msg);
 }
-// After a product is picked, ask quantity via tappable options (typed numbers also accepted)
 async function sendCatalogQty(a, c, node, prod) {
   const qtys = (node.qty_options && node.qty_options.length ? node.qty_options : ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]).map((x) => String(x)).slice(0, 10);
   await sendOptions(a, c, `*${prod.name}* — kitne chahiye?`, qtys);
 }
-// After an item is added, offer add-more / checkout (WhatsApp button titles max 20 chars!)
 async function sendCatalogMore(a, c, node) {
   const addL = (node.add_more_label || "➕ Add more").slice(0, 20);
   const coL = (node.checkout_label || "✅ Confirm").slice(0, 20);
@@ -226,7 +277,6 @@ async function sendCatalogMore(a, c, node) {
 function cartTotal(cart) { return (cart || []).reduce((s, it) => s + (Number(it.price) || 0) * (Number(it.qty) || 0), 0); }
 function cartLines(cart) { return (cart || []).map((it) => `• ${it.name} x${it.qty} — Rs ${(Number(it.price) || 0) * (Number(it.qty) || 0)}`).join("\n"); }
 function cartSummaryText(cart) { return cartLines(cart) + `\n\n*Total: Rs ${cartTotal(cart)}*`; }
-// Cart status message after each add — shows EVERY item so far + running total
 function buildCartMsg(cnode, cart, prod, qty, lineTotal) {
   const tmpl = (cnode && cnode.cart_line && cnode.cart_line.trim()) ? cnode.cart_line : "🛒 *Aapka cart:*\n{{cart}}\n\n*Total: Rs {{cartTotal}}*";
   return tmpl
@@ -236,7 +286,6 @@ function buildCartMsg(cnode, cart, prod, qty, lineTotal) {
     .replace(/\{\{\s*lineTotal\s*\}\}/g, String(lineTotal))
     .replace(/\{\{\s*cartTotal\s*\}\}/g, String(cartTotal(cart)));
 }
-// Post the full order (items + total + answers), run submit message + sheet, then advance the flow.
 async function finishCatalogOrder(a, c, s, def, cnode, cart, fans) {
   const summary = "🧾 *Order Summary*\n" + cartSummaryText(cart) +
     (Object.keys(fans || {}).length ? "\n\n" + Object.entries(fans).map(([k, v]) => `• ${k}: ${v}`).join("\n") : "");
@@ -255,7 +304,6 @@ async function finishCatalogOrder(a, c, s, def, cnode, cart, fans) {
   await advance(a, c, s, def);
 }
 
-// ===== Native WhatsApp Cloud interactive (real CTA button / list descriptions / footer) =====
 const convCache = new Map();
 async function getConvInfo(a, c) {
   const hit = convCache.get(c); if (hit && hit.exp > Date.now()) return hit.info;
@@ -276,14 +324,12 @@ async function getWaCreds(a, inboxId) {
   const key = `${a}:${inboxId}`;
   const hit = credsCache.get(key); if (hit && hit.exp > Date.now()) return hit.creds;
   let creds = null;
-  // 1) Chatwoot API (inbox provider_config) — works if Chatwoot returns the token
   try {
     const r = await cw.get(`${CHATWOOT_BASE_URL}/api/v1/accounts/${a}/inboxes/${inboxId}`, { headers: { api_access_token: ADMIN_TOKEN } });
     const d = r.data || {}; const pc = d.provider_config || (d.channel && d.channel.provider_config) || {};
     const token = pc.api_key || pc.access_token; const phoneId = pc.phone_number_id;
     if (token && phoneId) creds = { token, phoneId, src: "api" };
   } catch (e) {}
-  // 2) Chatwoot DB (reliable) — if CHATWOOT_DB_URL is set
   const db = await getChatwootDb();
   if (!creds && db) {
     try {
@@ -293,7 +339,6 @@ async function getWaCreds(a, inboxId) {
       if (token && phoneId) creds = { token, phoneId, src: "db" };
     } catch (e) { console.error("waCreds DB FAIL", e.message); }
   }
-  // 3) env fallback (single account, gated by WA_ACCOUNT_ID)
   if (!creds && WA_TOKEN && WA_PHONE_ID && (!WA_ACCOUNT_ID || String(a) === String(WA_ACCOUNT_ID))) creds = { token: WA_TOKEN, phoneId: WA_PHONE_ID, src: "env" };
   credsCache.set(key, { creds, exp: Date.now() + (creds ? 600000 : 120000) });
   console.log("getWaCreds", key, creds ? ("OK via " + creds.src) : "none");
@@ -366,15 +411,12 @@ async function trySendCtaNative(a, c, node) {
     return true;
   } catch (e) { console.error("ctaNative FAIL", e.response?.status, JSON.stringify(e.response?.data || e.message)); return false; }
 }
-// fire-and-forget (do NOT await) -> first reply isn't delayed by the status toggle
 function openConversation(a, c) { apiPost(`/api/v1/accounts/${a}/conversations/${c}/toggle_status`, { status: "open" }).catch((e) => console.error("openConversation", e.response?.data || e.message)); }
 
-// Update Tag -> merge with existing labels (does not remove current ones)
 async function addLabels(a, c, labels) {
   try {
     if (!labels || !labels.length) return;
     const H = { headers: { api_access_token: ADMIN_TOKEN } };
-    // 1) make sure each label exists as an account label (create the missing ones)
     try {
       const al = await cw.get(`${CHATWOOT_BASE_URL}/api/v1/accounts/${a}/labels`, H);
       const existing = (al.data?.payload || []).map((l) => (l.title || "").toLowerCase());
@@ -385,7 +427,6 @@ async function addLabels(a, c, labels) {
         }
       }
     } catch (le) { console.error("listLabels FAIL", le.response?.status, le.response?.data || le.message); }
-    // 2) merge with the conversation's current labels and apply
     let cur = [];
     try { const r = await cw.get(`${CHATWOOT_BASE_URL}/api/v1/accounts/${a}/conversations/${c}/labels`, H); cur = r.data?.payload || []; } catch {}
     const norm = labels.map((t) => String(t).toLowerCase().replace(/\s+/g, "_"));
@@ -404,7 +445,6 @@ function ctaText(node) {
   return out;
 }
 
-// ---- text helpers / matching ----
 const norm = (s) => String(s == null ? "" : s).toLowerCase().trim();
 const normLoose = (s) => norm(s).replace(/[^a-z0-9\u0600-\u06FF]+/g, "");
 function levenshtein(a, b) {
@@ -439,11 +479,10 @@ function validateFormat(text, fmt) {
     case "number": return /^-?\d+(\.\d+)?$/.test(t);
     case "email": return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(t);
     case "phone": return /^[+]?[\d\s\-()]{7,}$/.test(t);
-    default: return true; // "any"
+    default: return true;
   }
 }
 
-// ---- condition evaluation (single + multi with All/Any + Fuzzy) ----
 function evalSingle(cond, vars) {
   const subst = (str) => String(str == null ? "" : str).replace(/\{\{(\w+)\}\}/g, (_, k) => (vars[k] != null ? String(vars[k]) : ""));
   let a = cond.first ? subst(cond.first) : (vars.last_message || "");
@@ -470,7 +509,6 @@ function evalConditionNode(node, vars) {
   return (node.match === "any") ? list.some((c) => evalSingle(c, vars)) : list.every((c) => evalSingle(c, vars));
 }
 
-// Map a file extension to a MIME type (Chatwoot needs the content type for attachments)
 function extToMime(name) {
   const ext = (String(name).split("?")[0].split(".").pop() || "").toLowerCase();
   const map = { jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", gif: "image/gif", webp: "image/webp", bmp: "image/bmp", svg: "image/svg+xml", mp4: "video/mp4", webm: "video/webm", mov: "video/quicktime", mkv: "video/x-matroska", mp3: "audio/mpeg", ogg: "audio/ogg", oga: "audio/ogg", opus: "audio/ogg", wav: "audio/wav", m4a: "audio/mp4", aac: "audio/aac", amr: "audio/amr", flac: "audio/flac", weba: "audio/webm", pdf: "application/pdf" };
@@ -478,7 +516,6 @@ function extToMime(name) {
 }
 const AUDIO_EXT = ["ogg", "oga", "opus", "wav", "m4a", "aac", "amr", "flac", "weba", "mka"];
 function runFfmpeg(args) { return new Promise((res) => { try { const p = spawn("ffmpeg", args, { stdio: "ignore" }); p.on("close", (code) => res(code)); p.on("error", () => res(-1)); } catch { res(-1); } }); }
-// WhatsApp Cloud rejects most .ogg/.wav audio (needs OGG-OPUS / mp3 / m4a / aac). Auto-convert any audio to MP3 before sending.
 async function maybeTranscodeAudio(buffer, baseName) {
   const ext = (String(baseName).split(".").pop() || "").toLowerCase();
   if (!AUDIO_EXT.includes(ext)) return { buffer, filename: baseName, contentType: extToMime(baseName) };
@@ -498,7 +535,6 @@ async function maybeTranscodeAudio(buffer, baseName) {
   return { buffer, filename: baseName, contentType: extToMime(baseName) };
 }
 
-// Send a media file to Chatwoot as a real attachment (multipart/form-data, attachments[])
 async function sendMedia(a, c, url, caption) {
   try {
     if (!url) return;
@@ -507,12 +543,12 @@ async function sendMedia(a, c, url, caption) {
     const localPath = path.join(UPLOAD_DIR, path.basename(baseName));
     let buffer;
     if (clean.includes("/uploads/") && fs.existsSync(localPath)) {
-      buffer = fs.readFileSync(localPath); // gallery file lives on our own disk
+      buffer = fs.readFileSync(localPath);
     } else {
-      const resp = await cw.get(url, { responseType: "arraybuffer", maxContentLength: Infinity, maxBodyLength: Infinity }); // external / pasted link
+      const resp = await cw.get(url, { responseType: "arraybuffer", maxContentLength: Infinity, maxBodyLength: Infinity });
       buffer = Buffer.from(resp.data);
     }
-    const tx = await maybeTranscodeAudio(buffer, path.basename(baseName)); // auto -> mp3 for audio
+    const tx = await maybeTranscodeAudio(buffer, path.basename(baseName));
     const mediaUrl = `${CHATWOOT_BASE_URL}/api/v1/accounts/${a}/conversations/${c}/messages`;
     const mkForm = () => { const f = new FormData(); if (caption) f.append("content", caption); f.append("message_type", "outgoing"); f.append("attachments[]", tx.buffer, { filename: tx.filename, contentType: tx.contentType }); return f; };
     const postForm = (tok) => { const f = mkForm(); return cw.post(mediaUrl, f, { headers: { api_access_token: tok, ...f.getHeaders() }, maxContentLength: Infinity, maxBodyLength: Infinity }); };
@@ -523,46 +559,33 @@ async function sendMedia(a, c, url, caption) {
 
 function toSession(row, fpa) { return { nodeId: row.node_id, awaiting: row.awaiting, variables: typeof row.variables === "string" ? JSON.parse(row.variables) : (row.variables || {}), flowPublishedAt: row.flow_published_at ? new Date(row.flow_published_at).toISOString() : fpa }; }
 
-// rows of a list node (supports new sections[] or flat rows[])
 function listRows(node) { return Array.isArray(node.sections) && node.sections.length ? node.sections.flatMap((s) => s.rows || []) : (node.rows || []); }
 async function sendHeaderMedia(a, c, node) { const h = node.header || {}; if (["image", "video", "document"].includes(h.type) && h.value) await sendMedia(a, c, h.value, ""); }
 function withHeaderFooter(node, body) { let out = (node.header && node.header.type === "text" && node.header.value ? node.header.value + "\n\n" : "") + (body || ""); if (node.footer) out += "\n\n_" + node.footer + "_"; return out; }
-// Replace {{var}} tokens in a string using a variables object (used for messages sent outside runFlow's node walk)
 function substVars(str, vars) { return (str == null ? str : String(str).replace(/\{\{\s*(\w+)\s*\}\}/g, (_, k) => ((vars && vars[k] != null) ? String(vars[k]) : ""))); }
 
 async function runFlow(a, c, s, def) {
-  // Queue-based walker. A node's `next` may be a single id OR an array of ids; every target
-  // runs (fan-out). Existing single-`next` flows behave exactly as before (queue of one).
-  // Menus are recorded so every shown menu stays tappable (menu memory). At most one await
-  // state is kept; if several awaiting nodes appear in one fan-out, the last one wins.
   const startId = s.nodeId;
   const queue = Array.isArray(startId) ? startId.filter(Boolean) : (startId ? [startId] : []);
   if (!queue.length) { s.awaiting = null; s.nodeId = null; return; }
   if (s.variables) { delete s.variables.__delay_token; delete s.variables.__delay_next; delete s.variables.__delay_secs; }
   const seen = new Set();
-  // --- Personalization: replace {{senderName}}, {{senderId}}, {{message}}, {{receiverId}} and any saved var in all text a customer sees ---
   const vars = s.variables || {};
   const subst = (str) => substVars(str, vars);
   const applyVars = (node) => {
     if (!node || typeof node !== "object") return node;
     const n = { ...node };
-    // top-level text fields
     ["text", "caption", "body", "intro", "footer", "submit_message", "timeout_message"].forEach((k) => { if (typeof n[k] === "string") n[k] = subst(n[k]); });
-    // header text
     if (n.header && n.header.type === "text" && typeof n.header.value === "string") n.header = { ...n.header, value: subst(n.header.value) };
-    // buttons titles
     if (Array.isArray(n.buttons)) n.buttons = n.buttons.map((b) => (b && typeof b === "object" ? { ...b, title: subst(b.title) } : b));
-    // list rows (flat)
     if (Array.isArray(n.rows)) n.rows = n.rows.map((r) => (r && typeof r === "object" ? { ...r, title: subst(r.title), description: subst(r.description) } : r));
-    // list sections -> rows
     if (Array.isArray(n.sections)) n.sections = n.sections.map((sec) => (sec && typeof sec === "object" ? { ...sec, rows: Array.isArray(sec.rows) ? sec.rows.map((r) => (r && typeof r === "object" ? { ...r, title: subst(r.title), description: subst(r.description) } : r)) : sec.rows } : sec));
-    // form field labels
     if (Array.isArray(n.fields)) n.fields = n.fields.map((f) => (f && typeof f === "object" ? { ...f, label: subst(f.label) } : f));
     return n;
   };
   const nextsOf = (node) => { const v = node.next; const arr = Array.isArray(v) ? v : (v ? [v] : []); return arr.filter(Boolean); };
-  let awaitNode = null;   // { type, nodeId }
-  let delayNode = null;   // { nodeId, next }
+  let awaitNode = null;
+  let delayNode = null;
   let steps = 0;
 
   while (queue.length && steps < 300) {
@@ -572,7 +595,7 @@ async function runFlow(a, c, s, def) {
     seen.add(id);
     const rawNode = def.nodes[id];
     if (!rawNode) continue;
-    const node = applyVars(rawNode); // personalized copy ({{vars}} filled in); nextsOf uses same next values
+    const node = applyVars(rawNode);
 
     if (node.type === "text") { await sendText(a, c, node.text); nextsOf(node).forEach((x) => queue.push(x)); continue; }
     if (node.type === "media") { await sendMedia(a, c, node.url, node.caption); nextsOf(node).forEach((x) => queue.push(x)); continue; }
@@ -588,6 +611,20 @@ async function runFlow(a, c, s, def) {
       continue;
     }
 
+    // ===== APPOINTMENT NODE =====
+    if (node.type === "appointment") {
+      const bookUrl = `${PUBLIC_BASE_URL}/book?aid=${a}&cid=${c}`;
+      const ok = await trySendCtaNative(a, c, {
+        body: node.text || "📅 Appointment book karein — button tap karein 👇",
+        display: (node.button_text || "Book Appointment").slice(0, 20),
+        url: bookUrl,
+        footer: node.footer || ""
+      });
+      if (!ok) await sendText(a, c, (node.text || "📅 Appointment book karein:") + "\n\n🔗 " + bookUrl);
+      nextsOf(node).forEach((x) => queue.push(x));
+      continue;
+    }
+
     if (node.type === "buttons" || node.type === "list") {
       if (node.type === "buttons") {
         if (node.text_menu) { await sendHeaderMedia(a, c, node); const opts = (node.buttons || []).map((b, i) => `${i + 1}. ${b.title}`).join("\n"); await sendText(a, c, withHeaderFooter(node, (node.text || "Choose an option:") + "\n\n" + opts)); }
@@ -598,8 +635,8 @@ async function runFlow(a, c, s, def) {
       }
       s.variables.__opts = id; s.variables.__menus = [...(s.variables.__menus || []).filter((x) => x !== id), id].slice(-8);
       const dn = nextsOf(node);
-      if (dn.length) { dn.forEach((x) => queue.push(x)); } // default output(s) -> keep flowing immediately (menu stays tappable)
-      else { awaitNode = { type: node.type, nodeId: id }; } // terminal menu -> wait for a tap
+      if (dn.length) { dn.forEach((x) => queue.push(x)); }
+      else { awaitNode = { type: node.type, nodeId: id }; }
       continue;
     }
 
@@ -608,7 +645,7 @@ async function runFlow(a, c, s, def) {
       const ff = (node.fields || []).filter((fd) => (fd.label || "").trim());
       if (!ff.length) { nextsOf(node).forEach((x) => queue.push(x)); continue; }
       s.variables.__form_idx = 0; s.variables.__form_answers = {};
-      await sendFormField(a, c, ff[0]); // text -> question, list/buttons -> interactive menu
+      await sendFormField(a, c, ff[0]);
       awaitNode = { type: "form", nodeId: id };
       continue;
     }
@@ -617,8 +654,8 @@ async function runFlow(a, c, s, def) {
       const prods = (node.products || []).filter((p) => (p.name || "").trim());
       if (!prods.length) { nextsOf(node).forEach((x) => queue.push(x)); continue; }
       if (node.intro) await sendText(a, c, node.intro);
-      s.variables.__cart = [];                 // cart lives in session; start fresh
-      s.variables.__cat_stage = "pick";        // pick -> qty -> more -> form
+      s.variables.__cart = [];
+      s.variables.__cat_stage = "pick";
       s.variables.__form_idx = 0; s.variables.__form_answers = {};
       await sendCatalogProducts(a, c, prods);
       awaitNode = { type: "catalog", nodeId: id };
@@ -631,11 +668,8 @@ async function runFlow(a, c, s, def) {
       awaitNode = { type: "question", nodeId: id };
       continue;
     }
-    // unknown -> terminal branch
   }
 
-  // a pending delay is recorded regardless of whether a menu/question is also awaiting,
-  // so the delayed branch still fires while the menu stays tappable
   if (delayNode) {
     s.variables.__delay_token = Math.random().toString(36).slice(2);
     s.variables.__delay_next = delayNode.next;
@@ -646,13 +680,11 @@ async function runFlow(a, c, s, def) {
   else { s.awaiting = null; s.nodeId = null; }
 }
 
-// runFlow + persist + (re)schedule question timeout
 async function advance(a, c, s, def) { await runFlow(a, c, s, def); await saveSession(a, c, s); scheduleQuestionTimeout(a, c, s, def); scheduleDelayResume(a, c, s, def); }
 
-// Persisted, non-blocking delay resume. Mirrors scheduleQuestionTimeout but always continues.
 function scheduleDelayResume(a, c, s, def) {
   const token = s.variables && s.variables.__delay_token;
-  if (!token) return;                                              // no pending delay
+  if (!token) return;
   const secs = Math.max(0, Math.min(parseInt(s.variables.__delay_secs, 10) || 0, 86400));
   if (secs <= 0) return;
   const nextId = s.variables.__delay_next || null;
@@ -663,18 +695,17 @@ function scheduleDelayResume(a, c, s, def) {
       const cur = await getSession(a, c);
       if (!cur) return;
       const vars = typeof cur.variables === "string" ? JSON.parse(cur.variables) : (cur.variables || {});
-      if (vars.__delay_token !== token) return;                     // cancelled (user moved on) or replaced by a newer delay
+      if (vars.__delay_token !== token) return;
       const fr = await cachedPublishedFlow(a, inboxId);
       if (!fr) return;
-      // re-publish guard: if the flow was re-published after this delay began, cancel the stale delay
       if (new Date(fr.published_at).toISOString() !== publishedAt) return;
       const curDef = parseDef(fr.definition);
       const ns = toSession(cur, publishedAt);
-      ns.nodeId = nextId; ns.awaiting = null;                       // resume the delayed branch (runFlow clears the delay markers)
+      ns.nodeId = nextId; ns.awaiting = null;
       await runFlow(a, c, ns, curDef);
       await saveSession(a, c, ns);
       scheduleQuestionTimeout(a, c, ns, curDef);
-      scheduleDelayResume(a, c, ns, curDef);                        // support a chain with another delay further on
+      scheduleDelayResume(a, c, ns, curDef);
     } catch (e) { console.error("delayresume", e.message); }
   }, secs * 1000);
 }
@@ -690,7 +721,7 @@ function scheduleQuestionTimeout(a, c, s, def) {
       const cur = await getSession(a, c);
       if (!cur || cur.awaiting !== "question") return;
       const vars = typeof cur.variables === "string" ? JSON.parse(cur.variables) : (cur.variables || {});
-      if (vars.__q_token !== token) return; // user replied, or a newer question replaced it
+      if (vars.__q_token !== token) return;
       const ns = toSession(cur, s.flowPublishedAt);
       if (node.timeout_message) await sendText(a, c, node.timeout_message);
       if (node.continue_on_timeout) { ns.awaiting = null; ns.nodeId = node.next || null; await runFlow(a, c, ns, def); }
@@ -700,7 +731,6 @@ function scheduleQuestionTimeout(a, c, s, def) {
   }, ms);
 }
 
-// find which "next" an incoming reply (button/list selection) maps to
 function matchChoice(node, choice) {
   const t = norm(choice);
   if (!node) return null;
@@ -711,8 +741,6 @@ function matchChoice(node, choice) {
   return null;
 }
 
-// Match a reply against the CURRENT menu, the last menu, or ANY menu shown earlier in this chat,
-// so a button from an older menu still works even after the flow moved on.
 function resolveMenuChoice(def, s, text) {
   const vars = s.variables || {};
   const order = [];
@@ -737,7 +765,6 @@ app.post("/webhook", async (req, res) => {
     const accountId = event.account?.id; const conversationId = event.conversation?.id;
     const inboxId = event.conversation?.inbox_id ?? event.inbox?.id ?? event.conversation?.inbox?.id ?? null;
     if (!accountId || !conversationId) return;
-    // --- Customer (sender) details for personalization variables: {{senderName}}, {{senderId}}, {{receiverId}}, {{message}} ---
     const _sender = event.sender || event.conversation?.meta?.sender || {};
     const senderVars = {
       senderName: _sender.name || _sender.available_name || "",
@@ -750,13 +777,11 @@ app.post("/webhook", async (req, res) => {
     const flowPublishedAt = new Date(flowRow.published_at).toISOString();
     const session = await getSession(accountId, conversationId);
 
-    // --- Website widget: button/list click arrives as message_updated + submitted_values ---
     const submitted = event.content_attributes?.submitted_values;
     if (event.event === "message_updated" && Array.isArray(submitted) && submitted.length > 0) {
       const choice = (submitted[0].value || submitted[0].title || "").trim();
       if (session) {
         const s = toSession(session, flowPublishedAt); s.variables.last_message = choice; s.variables.message = choice; s.variables.__inbox = inboxId; Object.assign(s.variables, senderVars);
-        // Catalog & form drive their own menus; let their message_created handlers process the tap instead of routing it here.
         if (session.awaiting === "catalog" || session.awaiting === "form") {
           if (!event.content || !event.content.trim()) { event.content = choice; event.event = "message_created"; event.message_type = "incoming"; }
           else return;
@@ -781,11 +806,10 @@ app.post("/webhook", async (req, res) => {
 
     const isRepublished = session && session.flow_published_at && new Date(session.flow_published_at).getTime() < new Date(flowPublishedAt).getTime();
 
-    // No session yet, or flow was re-published -> (re)start the flow (optionally gated by On Message keywords)
     if (!session || isRepublished) {
       const trig = def.trigger || {};
-      if (trig.keywords && trig.keywords.length && !matchKeywords(text, trig.keywords, trig.fuzzy, trig.sensitivity)) return; // keyword set but not matched -> don't start
-      openConversation(accountId, conversationId); // fire-and-forget (don't delay the reply)
+      if (trig.keywords && trig.keywords.length && !matchKeywords(text, trig.keywords, trig.fuzzy, trig.sensitivity)) return;
+      openConversation(accountId, conversationId);
       const s = { nodeId: def.start, awaiting: null, variables: { last_message: text, message: text, __inbox: inboxId, ...senderVars }, flowPublishedAt };
       await advance(accountId, conversationId, s, def);
       return;
@@ -800,7 +824,7 @@ app.post("/webhook", async (req, res) => {
     if (session.awaiting === "question") {
       const node = def.nodes[session.node_id];
       if (node && node.response_format && !validateFormat(text, node.response_format)) {
-        await sendText(accountId, conversationId, substVars(node.text, s.variables)); // invalid format -> re-ask, stay awaiting
+        await sendText(accountId, conversationId, substVars(node.text, s.variables));
         await saveSession(accountId, conversationId, s);
         return;
       }
@@ -838,7 +862,6 @@ app.post("/webhook", async (req, res) => {
       const coL = ((cnode && cnode.checkout_label) || "✅ Confirm").slice(0, 20);
       const t = (text || "").trim();
 
-      // STAGE 1: picking a product — customer TYPES the number (1, 2, 3…) or the name
       if (stage === "pick") {
         let idx = -1;
         const num = parseInt(t.replace(/[^\d]/g, ""), 10);
@@ -850,14 +873,12 @@ app.post("/webhook", async (req, res) => {
         await saveSession(accountId, conversationId, s); return;
       }
 
-      // STAGE 2: choosing a quantity for the picked product
       if (stage === "qty") {
         const qty = parseInt(t.replace(/[^\d]/g, ""), 10);
         const pIdx = s.variables.__cat_pick;
         const prod = prods[pIdx];
         if (!prod || !qty || qty < 1) { if (prod) await sendCatalogQty(accountId, conversationId, cnode, prod); await saveSession(accountId, conversationId, s); return; }
         const lineTotal = (Number(prod.price) || 0) * qty;
-        // same product again? merge quantities instead of duplicate lines
         const existing = cart.find((it) => it.name === prod.name);
         if (existing) existing.qty = (Number(existing.qty) || 0) + qty;
         else cart.push({ name: prod.name, price: Number(prod.price) || 0, qty });
@@ -868,7 +889,6 @@ app.post("/webhook", async (req, res) => {
         await saveSession(accountId, conversationId, s); return;
       }
 
-      // STAGE 3: add more OR checkout
       if (stage === "more") {
         if (t === addL || /add|aur|more|zyada/i.test(t)) {
           s.variables.__cat_stage = "pick";
@@ -876,20 +896,16 @@ app.post("/webhook", async (req, res) => {
           await saveSession(accountId, conversationId, s); return;
         }
         if (t === coL || /check ?out|complete|done|order|confirm|ho ?gaya|bas/i.test(t)) {
-          // move to follow-up questions (reuse form fields)
           const ff = ((cnode && cnode.fields) || []).filter((fd) => (fd.label || "").trim());
           s.variables.__cat_stage = "form"; s.variables.__form_idx = 0; s.variables.__form_answers = {};
           if (ff.length) { await sendFormField(accountId, conversationId, ff[0]); await saveSession(accountId, conversationId, s); return; }
-          // no questions -> finish right away
           await finishCatalogOrder(accountId, conversationId, s, def, cnode, cart, {});
           return;
         }
-        // unrecognized -> re-show options
         await sendCatalogMore(accountId, conversationId, cnode);
         await saveSession(accountId, conversationId, s); return;
       }
 
-      // STAGE 4: answering follow-up questions
       if (stage === "form") {
         const ff = ((cnode && cnode.fields) || []).filter((fd) => (fd.label || "").trim());
         let fidx = s.variables.__form_idx || 0;
@@ -905,7 +921,6 @@ app.post("/webhook", async (req, res) => {
       await saveSession(accountId, conversationId, s); return;
     }
 
-    // The reply may be a tap from the CURRENT menu OR any menu shown earlier in this chat -> route it
     const mc = resolveMenuChoice(def, s, text);
     if (mc) {
       const mNode = def.nodes[mc.menuId];
@@ -913,14 +928,12 @@ app.post("/webhook", async (req, res) => {
       if (mNode && mNode.loop_menu && !s.awaiting && !s.nodeId) { s.nodeId = mc.menuId; await advance(accountId, conversationId, s, def); }
       return;
     }
-    // Awaiting a menu but the tap matched nothing -> re-show it (loop) so the user is never stuck, else stay quiet
     if (session.awaiting === "buttons" || session.awaiting === "list") {
       const cur = def.nodes[session.node_id];
       if (cur && cur.loop_menu) { s.nodeId = session.node_id; s.awaiting = null; await advance(accountId, conversationId, s, def); }
       else { await saveSession(accountId, conversationId, s); }
       return;
     }
-    // otherwise stay quiet (agent may be handling it)
     return;
   } catch (e) { console.error("webhook error:", e.message); }
 });
