@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>Book Appointment</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f0f4f8; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 16px; }
+.card { background: white; border-radius: 16px; width: 100%; max-width: 420px; box-shadow: 0 4px 24px rgba(0,0,0,.12); overflow: hidden; }
+.hdr { background: linear-gradient(135deg, #4C84FF, #0EA5E9); padding: 22px 20px; color: white; text-align: center; }
+.hdr h1 { font-size: 19px; font-weight: 700; margin-bottom: 3px; }
+.hdr p { font-size: 13px; opacity: .85; }
+.body { padding: 20px; }
+.step { display: none; }
+.step.active { display: block; }
+
+/* Calendar */
+.cal-nav { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
+.cal-nav button { background: none; border: 1px solid #e2e8f0; border-radius: 8px; width: 34px; height: 34px; cursor: pointer; font-size: 16px; color: #4a5568; display: grid; place-items: center; }
+.cal-nav button:hover { background: #f7fafc; }
+.cal-month { font-size: 15px; font-weight: 700; color: #1a202c; }
+.cal-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 2px; }
+.day-name { text-align: center; font-size: 10px; font-weight: 700; color: #a0aec0; padding: 6px 0; text-transform: uppercase; }
+.day { text-align: center; padding: 7px 2px; border-radius: 8px; font-size: 13px; cursor: pointer; color: #2d3748; font-weight: 500; transition: all .12s; position: relative; }
+.day:hover:not(.off) { background: #EBF4FF; color: #3182CE; }
+.day.today { color: #3182CE; font-weight: 800; }
+.day.sel { background: #4C84FF !important; color: white !important; font-weight: 700; }
+.day.off { color: #cbd5e0; cursor: default; pointer-events: none; }
+.day.empty { pointer-events: none; }
+
+/* Slots */
+.slots-hdr { font-size: 13px; font-weight: 700; color: #1a202c; margin: 18px 0 10px; }
+.slots-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 7px; }
+.slot { padding: 9px 4px; border: 1.5px solid #e2e8f0; border-radius: 8px; font-size: 12px; font-weight: 600; cursor: pointer; color: #2d3748; background: white; text-align: center; transition: all .12s; }
+.slot:hover { border-color: #4C84FF; color: #4C84FF; background: #EBF4FF; }
+.slot.sel { background: #4C84FF; border-color: #4C84FF; color: white; }
+.no-slots { text-align: center; padding: 20px; color: #a0aec0; font-size: 13px; }
+
+/* Form */
+.lbl { font-size: 12.5px; font-weight: 600; color: #4a5568; display: block; margin: 14px 0 5px; }
+.inp { width: 100%; padding: 10px 13px; border: 1.5px solid #e2e8f0; border-radius: 9px; font-size: 14px; color: #2d3748; font-family: inherit; transition: border-color .15s; }
+.inp:focus { outline: none; border-color: #4C84FF; box-shadow: 0 0 0 3px rgba(76,132,255,.1); }
+
+/* Summary box */
+.sum { background: #f7fafc; border-radius: 10px; padding: 13px 14px; margin-bottom: 14px; }
+.sum-row { font-size: 13px; color: #4a5568; margin-bottom: 5px; display: flex; gap: 7px; align-items: center; }
+.sum-row:last-child { margin-bottom: 0; }
+
+/* Buttons */
+.btn { width: 100%; padding: 12px; border: none; border-radius: 10px; font-size: 14px; font-weight: 700; cursor: pointer; font-family: inherit; transition: all .15s; margin-top: 10px; }
+.btn-blue { background: #4C84FF; color: white; }
+.btn-blue:hover { background: #3b72e8; }
+.btn-blue:disabled { background: #a0aec0; cursor: not-allowed; }
+.btn-ghost { background: white; color: #4a5568; border: 1.5px solid #e2e8f0; }
+.btn-ghost:hover { background: #f7fafc; }
+.back { display: inline-flex; align-items: center; gap: 4px; font-size: 13px; color: #718096; cursor: pointer; margin-bottom: 14px; }
+.back:hover { color: #4C84FF; }
+.err { background: #FFF5F5; border: 1px solid #FC8181; border-radius: 8px; padding: 10px 12px; color: #C53030; font-size: 13px; margin-bottom: 12px; }
+
+/* Success */
+.ok { text-align: center; padding: 16px 0; }
+.ok-icon { font-size: 52px; margin-bottom: 14px; }
+.ok h2 { font-size: 19px; font-weight: 700; color: #1a202c; margin-bottom: 7px; }
+.ok p { font-size: 13px; color: #718096; line-height: 1.6; }
+
+/* Spinner */
+.spin-wrap { text-align: center; padding: 22px; }
+.spinner { width: 30px; height: 30px; border: 3px solid #e2e8f0; border-top-color: #4C84FF; border-radius: 50%; animation: sp .7s linear infinite; margin: 0 auto 10px; }
+@keyframes sp { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="hdr">
+    <h1>📅 Book Appointment</h1>
+    <p id="hdSub">Choose a date and time</p>
+  </div>
+  <div class="body">
+
+    <!-- STEP 1: Date + Slot -->
+    <div class="step active" id="s1">
+      <div class="cal-nav">
+        <button onclick="prevM()">&#8249;</button>
+        <div class="cal-month" id="calLbl"></div>
+        <button onclick="nextM()">&#8250;</button>
+      </div>
+      <div class="cal-grid" id="calGrid"></div>
+      <div id="slotsWrap" style="display:none">
+        <div class="slots-hdr" id="slotsLbl">Available Times</div>
+        <div id="slotsInner"></div>
+      </div>
+      <div id="s1Next" style="display:none">
+        <button class="btn btn-blue" id="s1Btn" onclick="goS2()" disabled>Continue &rarr;</button>
+      </div>
+    </div>
+
+    <!-- STEP 2: Name + confirm -->
+    <div class="step" id="s2">
+      <div class="back" onclick="goS1()">&#8249; Back</div>
+      <div class="sum">
+        <div class="sum-row">📅 <span id="sumDate"></span></div>
+        <div class="sum-row">⏰ <span id="sumTime"></span></div>
+      </div>
+      <div id="errBox" class="err" style="display:none"></div>
+      <label class="lbl">Your Name *</label>
+      <input class="inp" id="nameInp" type="text" placeholder="Enter your full name" />
+      <label class="lbl">Notes (optional)</label>
+      <input class="inp" id="notesInp" type="text" placeholder="Anything we should know?" />
+      <button class="btn btn-blue" id="bookBtn" onclick="doBook()">Confirm Appointment ✓</button>
+      <button class="btn btn-ghost" onclick="goS1()">← Change Time</button>
+    </div>
+
+    <!-- STEP 3: Success -->
+    <div class="step" id="s3">
+      <div class="ok">
+        <div class="ok-icon">🎉</div>
+        <h2>Appointment Confirmed!</h2>
+        <p>You will receive a WhatsApp<br>confirmation shortly.</p>
+        <div class="sum" style="margin-top:16px;text-align:left">
+          <div class="sum-row">📅 <span id="okDate"></span></div>
+          <div class="sum-row">⏰ <span id="okTime"></span></div>
+          <div class="sum-row">👤 <span id="okName"></span></div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</div>
+<script>
+const P = new URLSearchParams(location.search);
+const AID = P.get('aid') || '';
+const CID = P.get('cid') || '';
+const MONTHS = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+const MSHORT = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+const DAYS = ['S','M','T','W','T','F','S'];
+
+let cfg = {}, selDate = null, selTime = null, selTimeLabel = null;
+let vy = new Date().getFullYear(), vm = new Date().getMonth();
+
+async function init() {
+  try {
+    const r = await fetch('/api/calendar/settings?account_id=' + AID);
+    const j = await r.json();
+    cfg = j.settings || {};
+  } catch(e) { cfg = {}; }
+  renderCal();
+}
+
+function renderCal() {
+  document.getElementById('calLbl').textContent = MONTHS[vm] + ' ' + vy;
+  const g = document.getElementById('calGrid');
+  g.innerHTML = '';
+  DAYS.forEach(d => { const el = document.createElement('div'); el.className = 'day-name'; el.textContent = d; g.appendChild(el); });
+  const first = new Date(vy, vm, 1).getDay();
+  const dim = new Date(vy, vm + 1, 0).getDate();
+  const today = new Date();
+  const wdays = (cfg.working_days || '1,2,3,4,5').split(',').map(Number);
+  const adv = parseInt(cfg.advance_days) || 14;
+  const maxD = new Date(today.getTime() + adv * 86400000);
+  for (let i = 0; i < first; i++) { const el = document.createElement('div'); el.className = 'day empty'; g.appendChild(el); }
+  for (let d = 1; d <= dim; d++) {
+    const el = document.createElement('div');
+    const dt = new Date(vy, vm, d);
+    const ds = `${vy}-${String(vm+1).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+    const past = dt < new Date(today.getFullYear(), today.getMonth(), today.getDate());
+    const far = dt > maxD;
+    const work = wdays.includes(dt.getDay());
+    const isToday = dt.toDateString() === today.toDateString();
+    el.textContent = d;
+    el.className = 'day' + (isToday ? ' today' : '') + (ds === selDate ? ' sel' : '') + (past || far || !work ? ' off' : '');
+    if (!past && !far && work) el.onclick = () => pickDate(ds);
+    g.appendChild(el);
+  }
+}
+
+async function pickDate(ds) {
+  if (selDate === ds) return;
+  selDate = ds; selTime = null; selTimeLabel = null;
+  document.getElementById('s1Btn').disabled = true;
+  renderCal();
+  const sw = document.getElementById('slotsWrap');
+  const si = document.getElementById('slotsInner');
+  sw.style.display = 'block';
+  si.innerHTML = '<div class="spin-wrap"><div class="spinner"></div><div style="font-size:12px;color:#a0aec0">Loading slots…</div></div>';
+  document.getElementById('s1Next').style.display = 'none';
+  try {
+    const r = await fetch('/api/calendar/slots?account_id=' + AID + '&date=' + ds);
+    const j = await r.json();
+    const slots = j.slots || [];
+    const [y, mo, d] = ds.split('-');
+    document.getElementById('slotsLbl').textContent = `${d} ${MSHORT[parseInt(mo)-1]} ${y} — Available Times`;
+    if (!slots.length) {
+      si.innerHTML = '<div class="no-slots">😔 No available slots on this date.<br>Please try another day.</div>';
+    } else {
+      const sg = document.createElement('div'); sg.className = 'slots-grid';
+      slots.forEach(s => {
+        const b = document.createElement('button');
+        b.className = 'slot' + (s.value === selTime ? ' sel' : '');
+        b.textContent = s.label;
+        b.onclick = () => pickSlot(s.value, s.label, slots);
+        sg.appendChild(b);
+      });
+      si.innerHTML = ''; si.appendChild(sg);
+    }
+  } catch(e) { si.innerHTML = '<div class="no-slots">❌ Error loading. Please try again.</div>'; }
+  document.getElementById('s1Next').style.display = 'block';
+}
+
+function pickSlot(val, label, slots) {
+  selTime = val; selTimeLabel = label;
+  document.querySelectorAll('.slot').forEach(b => b.classList.toggle('sel', b.textContent === label));
+  document.getElementById('s1Btn').disabled = false;
+}
+
+function prevM() { vm--; if (vm < 0) { vm = 11; vy--; } renderCal(); }
+function nextM() { vm++; if (vm > 11) { vm = 0; vy++; } renderCal(); }
+
+function goS1() {
+  document.getElementById('s1').classList.add('active');
+  document.getElementById('s2').classList.remove('active');
+}
+function goS2() {
+  if (!selDate || !selTime) return;
+  const [y, mo, d] = selDate.split('-');
+  document.getElementById('sumDate').textContent = `${d} ${MSHORT[parseInt(mo)-1]} ${y}`;
+  document.getElementById('sumTime').textContent = selTimeLabel;
+  document.getElementById('s1').classList.remove('active');
+  document.getElementById('s2').classList.add('active');
+  document.getElementById('errBox').style.display = 'none';
+  document.getElementById('nameInp').focus();
+}
+
+async function doBook() {
+  const name = document.getElementById('nameInp').value.trim();
+  const notes = document.getElementById('notesInp').value.trim();
+  const err = document.getElementById('errBox');
+  if (!name) { err.textContent = 'Please enter your name.'; err.style.display = 'block'; return; }
+  err.style.display = 'none';
+  const btn = document.getElementById('bookBtn');
+  btn.disabled = true; btn.textContent = 'Booking…';
+  try {
+    const r = await fetch('/api/calendar/book', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ account_id: AID, conversation_id: CID, date: selDate, time: selTime, name, notes })
+    });
+    const j = await r.json();
+    if (j.ok) {
+      const [y, mo, d] = selDate.split('-');
+      document.getElementById('okDate').textContent = `${d} ${MSHORT[parseInt(mo)-1]} ${y}`;
+      document.getElementById('okTime').textContent = selTimeLabel;
+      document.getElementById('okName').textContent = name;
+      document.getElementById('s2').classList.remove('active');
+      document.getElementById('s3').classList.add('active');
+    } else {
+      err.textContent = j.error || 'Booking failed. Please try again.';
+      err.style.display = 'block';
+      btn.disabled = false; btn.textContent = 'Confirm Appointment ✓';
+    }
+  } catch(e) {
+    err.textContent = 'Connection error. Please try again.';
+    err.style.display = 'block';
+    btn.disabled = false; btn.textContent = 'Confirm Appointment ✓';
+  }
+}
+
+init();
+</script>
+</body>
+</html>
