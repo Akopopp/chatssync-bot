@@ -28,19 +28,41 @@ export async function initDb() {
       filename TEXT NOT NULL, original_name TEXT, url TEXT NOT NULL,
       type TEXT, size BIGINT, created_at TIMESTAMPTZ DEFAULT NOW()
     );`);
+  // ===== Appointments — replaces the old calendar_settings table. =====
+  // No Google Calendar: slots are tracked entirely in appt_bookings, and
+  // appt_settings holds the working-hours config + Google Sheet link +
+  // the merchant's custom questions (JSONB array of {label, key, input_type}).
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS calendar_settings (
+    CREATE TABLE IF NOT EXISTS appt_settings (
       account_id INTEGER PRIMARY KEY,
-      calendar_id TEXT DEFAULT '',
-      slot_duration INTEGER DEFAULT 30,
-      buffer_time INTEGER DEFAULT 0,
+      working_days TEXT DEFAULT '1,2,3,4,5',
       start_time TEXT DEFAULT '09:00',
       end_time TEXT DEFAULT '17:00',
-      working_days TEXT DEFAULT '1,2,3,4,5',
+      slot_duration INTEGER DEFAULT 30,
+      buffer_time INTEGER DEFAULT 0,
       advance_days INTEGER DEFAULT 14,
-      timezone TEXT DEFAULT 'Asia/Karachi',
-      apt_title TEXT DEFAULT 'Appointment',
+      sheet_url TEXT DEFAULT '',
+      questions JSONB DEFAULT '[]'::jsonb,
+      waba_id TEXT DEFAULT '',
+      flow_id TEXT DEFAULT '',
+      flow_inbox_id INTEGER,
+      flow_status TEXT DEFAULT '',
       updated_at TIMESTAMPTZ DEFAULT NOW()
+    );`);
+  await pool.query(`ALTER TABLE appt_settings ADD COLUMN IF NOT EXISTS waba_id TEXT DEFAULT '';`);
+  await pool.query(`ALTER TABLE appt_settings ADD COLUMN IF NOT EXISTS flow_id TEXT DEFAULT '';`);
+  await pool.query(`ALTER TABLE appt_settings ADD COLUMN IF NOT EXISTS flow_inbox_id INTEGER;`);
+  await pool.query(`ALTER TABLE appt_settings ADD COLUMN IF NOT EXISTS flow_status TEXT DEFAULT '';`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS appt_bookings (
+      id SERIAL PRIMARY KEY,
+      account_id INTEGER NOT NULL,
+      date TEXT NOT NULL,
+      time TEXT NOT NULL,
+      answers JSONB DEFAULT '{}'::jsonb,
+      conversation_id INTEGER,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE (account_id, date, time)
     );`);
   console.log("DB tables ready");
 }
@@ -83,22 +105,55 @@ export async function saveSession(accountId, conversationId, s) {
   await pool.query(`INSERT INTO bot_sessions (account_id, conversation_id, node_id, awaiting, variables, flow_published_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,NOW()) ON CONFLICT (account_id, conversation_id) DO UPDATE SET node_id=$3, awaiting=$4, variables=$5, flow_published_at=$6, updated_at=NOW()`, [accountId, conversationId, s.nodeId, s.awaiting, JSON.stringify(s.variables || {}), s.flowPublishedAt]);
 }
 
-export async function getCalSettings(accountId) {
-  const { rows } = await pool.query(`SELECT * FROM calendar_settings WHERE account_id=$1`, [accountId]);
+// ===== APPOINTMENTS (Google Sheets + self-tracked slots, no Calendar) =====
+
+export async function getApptSettings(accountId) {
+  const { rows } = await pool.query(`SELECT * FROM appt_settings WHERE account_id=$1`, [accountId]);
   return rows[0] || null;
 }
-export async function saveCalSettings(accountId, s) {
+
+export async function saveApptSettings(accountId, s) {
   const { rows } = await pool.query(`
-    INSERT INTO calendar_settings (account_id,calendar_id,slot_duration,buffer_time,start_time,end_time,working_days,advance_days,timezone,apt_title,updated_at)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())
+    INSERT INTO appt_settings (account_id,working_days,start_time,end_time,slot_duration,buffer_time,advance_days,sheet_url,questions,waba_id,flow_id,flow_inbox_id,flow_status,updated_at)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NOW())
     ON CONFLICT (account_id) DO UPDATE SET
-      calendar_id=$2,slot_duration=$3,buffer_time=$4,start_time=$5,end_time=$6,
-      working_days=$7,advance_days=$8,timezone=$9,apt_title=$10,updated_at=NOW()
+      working_days=$2,start_time=$3,end_time=$4,slot_duration=$5,buffer_time=$6,
+      advance_days=$7,sheet_url=$8,questions=$9,
+      waba_id=COALESCE($10, appt_settings.waba_id),
+      flow_id=COALESCE($11, appt_settings.flow_id),
+      flow_inbox_id=COALESCE($12, appt_settings.flow_inbox_id),
+      flow_status=COALESCE($13, appt_settings.flow_status),
+      updated_at=NOW()
     RETURNING *`,
-    [accountId, s.calendar_id||'', s.slot_duration||30, s.buffer_time||0,
-     s.start_time||'09:00', s.end_time||'17:00', s.working_days||'1,2,3,4,5',
-     s.advance_days||14, s.timezone||'Asia/Karachi', s.apt_title||'Appointment']);
+    [accountId, s.working_days || '1,2,3,4,5', s.start_time || '09:00', s.end_time || '17:00',
+     s.slot_duration || 30, s.buffer_time || 0, s.advance_days || 14,
+     s.sheet_url || '', JSON.stringify(s.questions || []),
+     s.waba_id ?? null, s.flow_id ?? null, s.flow_inbox_id ?? null, s.flow_status ?? null]);
   return rows[0];
+}
+
+export async function listApptBookings(accountId, date) {
+  if (date) {
+    const { rows } = await pool.query(`SELECT * FROM appt_bookings WHERE account_id=$1 AND date=$2 ORDER BY time`, [accountId, date]);
+    return rows;
+  }
+  const { rows } = await pool.query(`SELECT * FROM appt_bookings WHERE account_id=$1 ORDER BY date, time`, [accountId]);
+  return rows;
+}
+
+export async function getApptBookingBySlot(accountId, date, time) {
+  const { rows } = await pool.query(`SELECT * FROM appt_bookings WHERE account_id=$1 AND date=$2 AND time=$3`, [accountId, date, time]);
+  return rows[0] || null;
+}
+
+export async function createApptBooking(accountId, date, time, answers, conversationId) {
+  const { rows } = await pool.query(
+    `INSERT INTO appt_bookings (account_id, date, time, answers, conversation_id)
+     VALUES ($1,$2,$3,$4,$5)
+     ON CONFLICT (account_id, date, time) DO NOTHING
+     RETURNING *`,
+    [accountId, date, time, JSON.stringify(answers || {}), conversationId || null]);
+  return rows[0] || null;
 }
 
 export { pool };
