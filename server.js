@@ -13,9 +13,9 @@ import {
   initDb, seedFlowIfEmpty, getPublishedFlowForInbox, getSession, saveSession,
   listFlows, createFlow, getFlowById, saveFlowById, publishFlowById, unpublishFlowById, deleteFlowById, assignInbox,
   addMedia, listMedia, getMedia, deleteMedia,
-  getCalSettings, saveCalSettings,
+  getApptSettings, saveApptSettings,
+  listApptBookings, createApptBooking, getApptBookingBySlot,
 } from "./db.js";
-import { getSlots, createEvent } from "./calendar.js";
 
 const PORT = process.env.PORT || 3000;
 const CHATWOOT_BASE_URL = process.env.CHATWOOT_BASE_URL;
@@ -40,6 +40,7 @@ async function getChatwootDb() {
   return chatwootDb;
 }
 
+// ===== GOOGLE SHEETS (only integration left — no Calendar anymore) =====
 const GOOGLE_SA_JSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON || "";
 let _gTok = null, _gTokExp = 0;
 async function getGoogleToken() {
@@ -57,14 +58,17 @@ async function getGoogleToken() {
     return _gTok;
   } catch (e) { console.error("googleSheets token FAIL", e.response?.data?.error_description || e.message); return null; }
 }
+function sheetIdFromUrl(sheetUrl) {
+  const m = String(sheetUrl || "").match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+  return m ? m[1] : null;
+}
 async function appendToSheet(sheetUrl, data) {
   try {
     if (!sheetUrl) return;
-    const m = String(sheetUrl).match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
-    if (!m) { console.log("appendToSheet: bad sheet url"); return; }
+    const id = sheetIdFromUrl(sheetUrl);
+    if (!id) { console.log("appendToSheet: bad sheet url"); return; }
     const token = await getGoogleToken();
     if (!token) { console.log("appendToSheet: GOOGLE_SERVICE_ACCOUNT_JSON not set/invalid"); return; }
-    const id = m[1];
     const base = `https://sheets.googleapis.com/v4/spreadsheets/${id}/values`;
     const H = { headers: { Authorization: `Bearer ${token}` }, timeout: 15000 };
     let headers = [];
@@ -76,6 +80,19 @@ async function appendToSheet(sheetUrl, data) {
     await axios.post(`${base}/A1:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`, { values: [row] }, H);
     console.log("appendToSheet OK", id);
   } catch (e) { console.error("appendToSheet FAIL", e.response?.data?.error?.message || e.message); }
+}
+async function checkSheetAccess(sheetUrl) {
+  const id = sheetIdFromUrl(sheetUrl);
+  if (!id) return { ok: false, error: "That doesn't look like a Google Sheets link." };
+  const token = await getGoogleToken();
+  if (!token) return { ok: false, error: "GOOGLE_SERVICE_ACCOUNT_JSON not set on the server." };
+  try {
+    await axios.get(`https://sheets.googleapis.com/v4/spreadsheets/${id}?fields=spreadsheetId`, { headers: { Authorization: `Bearer ${token}` }, timeout: 15000 });
+    return { ok: true };
+  } catch (e) {
+    const msg = e.response?.data?.error?.message || e.message;
+    return { ok: false, error: "Couldn't access this sheet. Share it with the service account email (Editor access). " + msg };
+  }
 }
 
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
@@ -98,11 +115,6 @@ app.use((req, res, next) => {
 
 app.use("/uploads", express.static(UPLOAD_DIR));
 app.use(express.static("public"));
-app.get("/book", (req, res) => {
-  const f = path.join(process.cwd(), "public", "book.html");
-  if (fs.existsSync(f)) return res.sendFile(f);
-  res.status(404).send("Booking page not found. Create public/book.html");
-});
 
 app.get("/", (req, res) => res.send("ChatsSync bot engine is running"));
 const parseDef = (d) => (typeof d === "string" ? JSON.parse(d) : d);
@@ -156,62 +168,278 @@ app.post("/api/flows/:id/unpublish", async (req, res) => { try { const row = awa
 app.delete("/api/flows/:id", async (req, res) => { try { await deleteFlowById(parseInt(req.params.id, 10)); clearFlowCache(); res.json({ ok: true }); } catch (e) { res.status(500).json({ error: e.message }); } });
 app.post("/api/flows/:id/assign-inbox", async (req, res) => { try { const inboxId = (req.body || {}).inbox_id; const row = await assignInbox(parseInt(req.params.id, 10), inboxId != null ? parseInt(inboxId, 10) : null); if (!row) return res.status(404).json({ error: "not found" }); clearFlowCache(); res.json({ ok: true, flow: { id: row.id, inbox_id: row.inbox_id } }); } catch (e) { res.status(500).json({ error: e.message }); } });
 
-// ===== CALENDAR SETTINGS + BOOKING =====
-app.get("/api/calendar/settings", async (req, res) => {
+// ===================================================================
+// ===== APPOINTMENTS — self-contained slot tracking + Sheets sync =====
+// ===================================================================
+// No Google Calendar. The bot tracks its own bookings in the database
+// (appt_bookings table) and, on every successful booking, appends a
+// row to the client's Google Sheet so they have a live record.
+
+function pad2(n) { return String(n).padStart(2, "0"); }
+function dateStr(d) { return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`; }
+function minutesToHHMM(mins) { const h = Math.floor(mins / 60), m = mins % 60; return `${pad2(h)}:${pad2(m)}`; }
+function hhmmToMinutes(hhmm) { const [h, m] = String(hhmm || "00:00").split(":").map((x) => parseInt(x, 10) || 0); return h * 60 + m; }
+
+// Build the list of slot start-times (HH:MM) for a given date, based on settings.
+function buildDaySlots(cfg, dateISO) {
+  const wdays = String(cfg.working_days || "1,2,3,4,5").split(",").map((x) => parseInt(x, 10));
+  const d = new Date(dateISO + "T00:00:00");
+  if (!wdays.includes(d.getDay())) return [];
+  const startMin = hhmmToMinutes(cfg.start_time || "09:00");
+  const endMin = hhmmToMinutes(cfg.end_time || "17:00");
+  const dur = Math.max(5, parseInt(cfg.slot_duration, 10) || 30);
+  const buf = Math.max(0, parseInt(cfg.buffer_time, 10) || 0);
+  const step = dur + buf;
+  const out = [];
+  for (let t = startMin; t + dur <= endMin; t += step) out.push(minutesToHHMM(t));
+  return out;
+}
+function fmtDateLabel(dateISO) {
+  const [y, mo, d] = dateISO.split("-");
+  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  return `${parseInt(d, 10)} ${months[parseInt(mo, 10) - 1]} ${y}`;
+}
+function fmtTimeLabel(hhmm) {
+  const [h, m] = hhmm.split(":").map(Number);
+  const ap = h >= 12 ? "PM" : "AM";
+  const h12 = h === 0 ? 12 : h > 12 ? h - 12 : h;
+  return `${pad2(h12)}:${pad2(m)} ${ap}`;
+}
+
+app.get("/api/appointments/settings", async (req, res) => {
   try {
     const accountId = parseInt(req.query.account_id, 10);
     if (!accountId) return res.status(400).json({ error: "account_id required" });
-    const s = await getCalSettings(accountId);
-    let serviceEmail = "";
-    if (GOOGLE_SA_JSON) { try { serviceEmail = JSON.parse(GOOGLE_SA_JSON).client_email || ""; } catch {} }
-    res.json({ ok: true, settings: s || {}, service_email: serviceEmail });
+    const s = await getApptSettings(accountId);
+    res.json({ ok: true, settings: s || {} });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-
-app.put("/api/calendar/settings", async (req, res) => {
+app.put("/api/appointments/settings", async (req, res) => {
   try {
-    const { account_id, ...settings } = req.body || {};
+    const { account_id, sheet_url, ...settings } = req.body || {};
     const accountId = parseInt(account_id, 10);
     if (!accountId) return res.status(400).json({ error: "account_id required" });
-    const row = await saveCalSettings(accountId, settings);
+    if (sheet_url && sheet_url.trim()) {
+      const chk = await checkSheetAccess(sheet_url.trim());
+      if (!chk.ok) return res.status(400).json({ error: chk.error });
+    }
+    const row = await saveApptSettings(accountId, { ...settings, sheet_url: (sheet_url || "").trim() });
     res.json({ ok: true, settings: row });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+// quick "test the sheet connection" button in the UI
+app.post("/api/appointments/check-sheet", async (req, res) => {
+  try {
+    const { sheet_url } = req.body || {};
+    if (!sheet_url) return res.status(400).json({ error: "sheet_url required" });
+    const chk = await checkSheetAccess(sheet_url);
+    if (!chk.ok) return res.status(400).json({ error: chk.error });
+    let serviceEmail = "";
+    if (GOOGLE_SA_JSON) { try { serviceEmail = JSON.parse(GOOGLE_SA_JSON).client_email || ""; } catch {} }
+    res.json({ ok: true, service_email: serviceEmail });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.get("/api/appointments/service-email", async (req, res) => {
+  let serviceEmail = "";
+  if (GOOGLE_SA_JSON) { try { serviceEmail = JSON.parse(GOOGLE_SA_JSON).client_email || ""; } catch {} }
+  res.json({ ok: true, service_email: serviceEmail });
+});
 
-app.get("/api/calendar/slots", async (req, res) => {
+// Slots for one date — computed from settings + our own bookings table (no Calendar call at all)
+app.get("/api/appointments/slots", async (req, res) => {
   try {
     const accountId = parseInt(req.query.account_id, 10);
     const date = req.query.date;
     if (!accountId || !date) return res.status(400).json({ error: "account_id and date required" });
-    if (!GOOGLE_SA_JSON) return res.json({ ok: true, slots: [] });
-    const cfg = await getCalSettings(accountId);
-    if (!cfg || !cfg.calendar_id) return res.json({ ok: true, slots: [], error: "Calendar not configured" });
-    const slots = await getSlots(GOOGLE_SA_JSON, cfg.calendar_id, date, cfg);
-    res.json({ ok: true, slots });
-  } catch (e) { console.error("GET /api/calendar/slots", e.message); res.status(500).json({ error: e.message }); }
+    const cfg = (await getApptSettings(accountId)) || {};
+    const all = buildDaySlots(cfg, date);
+    const booked = new Set((await listApptBookings(accountId, date)).map((b) => b.time));
+    const slots = all.map((t) => ({ time: t, label: fmtTimeLabel(t), available: !booked.has(t) }));
+    res.json({ ok: true, date, date_label: fmtDateLabel(date), slots });
+  } catch (e) { console.error("GET /api/appointments/slots", e.message); res.status(500).json({ error: e.message }); }
 });
 
-app.post("/api/calendar/book", async (req, res) => {
+// Combined date+time slot list for the next N days — this is what fills the
+// WhatsApp Flow's dropdown (no live endpoint needed: computed once, sent with
+// the message). Each entry's `id` is "YYYY-MM-DD|HH:MM" so submission parses cleanly.
+async function buildUpcomingSlotOptions(accountId, maxOptions) {
+  const cfg = (await getApptSettings(accountId)) || {};
+  const advance = Math.max(1, Math.min(parseInt(cfg.advance_days, 10) || 14, 30));
+  const today = new Date();
+  const out = [];
+  for (let i = 0; i < advance && out.length < (maxOptions || 25); i++) {
+    const d = new Date(today); d.setDate(d.getDate() + i);
+    const iso = dateStr(d);
+    const daySlots = buildDaySlots(cfg, iso);
+    if (!daySlots.length) continue;
+    const booked = new Set((await listApptBookings(accountId, iso)).map((b) => b.time));
+    for (const t of daySlots) {
+      if (booked.has(t)) continue;
+      out.push({ id: `${iso}|${t}`, title: `${fmtDateLabel(iso)} – ${fmtTimeLabel(t)}` });
+      if (out.length >= (maxOptions || 25)) break;
+    }
+  }
+  return out;
+}
+
+// List of upcoming bookable dates (used by the Flow's date-picker screen)
+app.get("/api/appointments/dates", async (req, res) => {
   try {
-    const { account_id, conversation_id, date, time, name, notes } = req.body || {};
+    const accountId = parseInt(req.query.account_id, 10);
+    if (!accountId) return res.status(400).json({ error: "account_id required" });
+    const cfg = (await getApptSettings(accountId)) || {};
+    const advance = Math.max(1, Math.min(parseInt(cfg.advance_days, 10) || 14, 90));
+    const out = [];
+    const today = new Date();
+    for (let i = 0; i < advance && out.length < 30; i++) {
+      const d = new Date(today); d.setDate(d.getDate() + i);
+      const iso = dateStr(d);
+      if (buildDaySlots(cfg, iso).length) out.push({ date: iso, label: fmtDateLabel(iso) });
+    }
+    res.json({ ok: true, dates: out });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+async function bookAppointmentInternal(accountId, { date, time, answers, convId }) {
+  const cfg = (await getApptSettings(accountId)) || {};
+  const daySlots = buildDaySlots(cfg, date);
+  if (!daySlots.includes(time)) return { ok: false, error: "That time isn't a valid slot." };
+  const existing = await getApptBookingBySlot(accountId, date, time);
+  if (existing) return { ok: false, error: "slot_taken" };
+  const row = await createApptBooking(accountId, date, time, answers || {}, convId || null);
+  if (cfg.sheet_url) {
+    const sheetRow = { Time: new Date().toLocaleString(), Date: fmtDateLabel(date), Slot: fmtTimeLabel(time), ...(answers || {}) };
+    appendToSheet(cfg.sheet_url, sheetRow).catch(() => {});
+  }
+  return { ok: true, booking: row };
+}
+
+// Builds the Meta Flow JSON for a "no endpoint" (static) booking flow: one
+// screen with a slot dropdown (data-bound, filled at send-time) plus the
+// merchant's custom questions as text inputs, then a Submit/Complete action.
+// This JSON is created/updated ONCE via the Graph API (not per message).
+function buildApptFlowJson(questions) {
+  const qFields = (questions || []).filter((q) => (q.label || "").trim()).map((q) => ({
+    type: "TextInput",
+    required: true,
+    label: clip(q.label, 80),
+    name: q.key || q.label,
+    "input-type": q.input_type === "number" ? "number" : q.input_type === "email" ? "email" : q.input_type === "phone" ? "phone" : "text",
+  }));
+  return {
+    version: "6.3",
+    screens: [
+      {
+        id: "BOOKING",
+        title: "Book Appointment",
+        data: { slots: { type: "array", items: { type: "object", properties: { id: { type: "string" }, title: { type: "string" } } } } },
+        layout: {
+          type: "SingleColumnLayout",
+          children: [
+            { type: "Dropdown", name: "slot", label: "Select date & time", required: true, "data-source": "${data.slots}" },
+            ...qFields,
+            { type: "Footer", label: "Confirm booking", "on-click-action": { name: "complete", payload: { slot: "${form.slot}", ...Object.fromEntries(qFields.map((f) => [f.name, `\${form.${f.name}}`])) } } },
+          ],
+        },
+      },
+    ],
+  };
+}
+app.get("/api/appointments/flow-json", async (req, res) => {
+  try {
+    const accountId = parseInt(req.query.account_id, 10);
+    if (!accountId) return res.status(400).json({ error: "account_id required" });
+    const cfg = (await getApptSettings(accountId)) || {};
+    const questions = (cfg.questions ? (typeof cfg.questions === "string" ? JSON.parse(cfg.questions) : cfg.questions) : []);
+    res.json({ ok: true, flow_json: buildApptFlowJson(questions) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ===== Per-account Flow creation — THIS is what makes it multi-tenant. =====
+// Each merchant's own WhatsApp Business Account (WABA) needs its own Flow,
+// created with that merchant's own access token (fetched via getWaCreds,
+// same lookup used for sending messages). One global Flow ID cannot work
+// across different clients' WABAs.
+async function graphCreateFlow(token, wabaId, name) {
+  const r = await axios.post(`https://graph.facebook.com/${WA_VER}/${wabaId}/flows`,
+    { name, categories: ["OTHER"] },
+    { headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, timeout: 20000 });
+  return r.data; // { id }
+}
+async function graphUploadFlowAsset(token, flowId, flowJsonObj) {
+  const fd = new FormData();
+  fd.append("name", "flow.json");
+  fd.append("asset_type", "FLOW_JSON");
+  fd.append("file", Buffer.from(JSON.stringify(flowJsonObj)), { filename: "flow.json", contentType: "application/json" });
+  const r = await axios.post(`https://graph.facebook.com/${WA_VER}/${flowId}/assets`, fd,
+    { headers: { Authorization: `Bearer ${token}`, ...fd.getHeaders() }, timeout: 20000 });
+  return r.data;
+}
+async function graphPublishFlow(token, flowId) {
+  const r = await axios.post(`https://graph.facebook.com/${WA_VER}/${flowId}/publish`, {},
+    { headers: { Authorization: `Bearer ${token}` }, timeout: 20000 });
+  return r.data;
+}
+async function graphGetFlowStatus(token, flowId) {
+  const r = await axios.get(`https://graph.facebook.com/${WA_VER}/${flowId}?fields=status,validation_errors`,
+    { headers: { Authorization: `Bearer ${token}` }, timeout: 15000 });
+  return r.data;
+}
+
+app.post("/api/appointments/create-flow", async (req, res) => {
+  try {
+    const { account_id, inbox_id, waba_id } = req.body || {};
     const accountId = parseInt(account_id, 10);
-    const convId = parseInt(conversation_id, 10);
-    if (!accountId || !convId || !date || !time || !name) return res.status(400).json({ error: "Missing required fields" });
-    if (!GOOGLE_SA_JSON) return res.status(400).json({ error: "Google Calendar not configured on server" });
-    const cfg = await getCalSettings(accountId);
-    if (!cfg || !cfg.calendar_id) return res.status(400).json({ error: "Calendar not set up. Please configure in ChatsSync chatbot builder." });
-    await createEvent(GOOGLE_SA_JSON, cfg.calendar_id, date, time, name, notes || "", cfg.apt_title || "Appointment", cfg.slot_duration || 30, cfg.timezone || "Asia/Karachi");
-    const [y, mo, d] = date.split("-");
-    const months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
-    const dateLbl = `${d} ${months[parseInt(mo)-1]} ${y}`;
-    const [h, m] = time.split(":").map(Number);
-    const ap = h >= 12 ? "PM" : "AM";
-    const h12 = h === 0 ? 12 : h > 12 ? h - 12 : h;
-    const timeLbl = `${String(h12).padStart(2,"0")}:${String(m).padStart(2,"0")} ${ap}`;
-    const msg = `✅ *Appointment Confirmed!*\n\n👤 Name: ${name}\n📅 Date: ${dateLbl}\n⏰ Time: ${timeLbl}${notes ? "\n📝 Notes: " + notes : ""}\n\nHum aapka intezaar karenge! 🙌`;
-    await sendText(accountId, convId, msg);
-    res.json({ ok: true });
-  } catch (e) { console.error("POST /api/calendar/book", e.response?.data || e.message); res.status(500).json({ error: e.message || "Booking failed" }); }
+    const inboxId = parseInt(inbox_id, 10);
+    if (!accountId || !inboxId || !waba_id) return res.status(400).json({ error: "account_id, inbox_id and waba_id are all required" });
+    const creds = await getWaCreds(accountId, inboxId);
+    if (!creds) return res.status(400).json({ error: "Couldn't find WhatsApp API credentials for that number. Make sure it's a connected Cloud API inbox." });
+
+    const cfg = (await getApptSettings(accountId)) || {};
+    const questions = (cfg.questions ? (typeof cfg.questions === "string" ? JSON.parse(cfg.questions) : cfg.questions) : []);
+    const flowJson = buildApptFlowJson(questions);
+
+    let flowId = cfg.flow_id || "";
+    try {
+      if (!flowId) {
+        const created = await graphCreateFlow(creds.token, waba_id, "Appointment Booking");
+        flowId = created.id;
+      }
+      await graphUploadFlowAsset(creds.token, flowId, flowJson);
+      await graphPublishFlow(creds.token, flowId);
+      await saveApptSettings(accountId, { ...cfg, waba_id, flow_id: flowId, flow_inbox_id: inboxId, flow_status: "PUBLISHED" });
+      res.json({ ok: true, flow_id: flowId, status: "PUBLISHED" });
+    } catch (ge) {
+      const detail = ge.response?.data?.error?.error_user_msg || ge.response?.data?.error?.message || ge.message;
+      // Still save whatever flow_id we got so the merchant isn't stuck re-creating a duplicate Flow.
+      if (flowId) await saveApptSettings(accountId, { ...cfg, waba_id, flow_id: flowId, flow_inbox_id: inboxId, flow_status: "ERROR" });
+      res.status(400).json({ error: "Meta rejected the Flow: " + detail, flow_id: flowId || null });
+    }
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get("/api/appointments/flow-status", async (req, res) => {
+  try {
+    const accountId = parseInt(req.query.account_id, 10);
+    if (!accountId) return res.status(400).json({ error: "account_id required" });
+    const cfg = (await getApptSettings(accountId)) || {};
+    if (!cfg.flow_id) return res.json({ ok: true, flow_id: null });
+    const creds = await getWaCreds(accountId, cfg.flow_inbox_id);
+    if (!creds) return res.json({ ok: true, flow_id: cfg.flow_id, status: cfg.flow_status || "unknown" });
+    try {
+      const live = await graphGetFlowStatus(creds.token, cfg.flow_id);
+      res.json({ ok: true, flow_id: cfg.flow_id, status: live.status, validation_errors: live.validation_errors || [] });
+    } catch (ge) { res.json({ ok: true, flow_id: cfg.flow_id, status: cfg.flow_status || "unknown" }); }
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get("/api/appointments/bookings", async (req, res) => {
+  try {
+    const accountId = parseInt(req.query.account_id, 10);
+    if (!accountId) return res.status(400).json({ error: "account_id required" });
+    const date = req.query.date || null;
+    res.json({ ok: true, bookings: await listApptBookings(accountId, date) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get("/api/inboxes", async (req, res) => {
@@ -411,6 +639,41 @@ async function trySendCtaNative(a, c, node) {
     return true;
   } catch (e) { console.error("ctaNative FAIL", e.response?.status, JSON.stringify(e.response?.data || e.message)); return false; }
 }
+
+// ===== WHATSAPP FLOW SEND (replaces the old cta_url appointment button) =====
+// Sends a `flow` interactive message. WA_APPOINTMENT_FLOW_ID must be created
+// once via the Meta Flow Builder / Graph API and its published ID stored here.
+async function trySendFlowNative(a, c, node) {
+  try {
+    const info = await getConvInfo(a, c); if (!info.number || !info.inboxId) return false;
+    const creds = await getWaCreds(a, info.inboxId); if (!creds) return false;
+    const cfg = (await getApptSettings(a)) || {};
+    const flowId = cfg.flow_id || node.flow_id || process.env.WA_APPOINTMENT_FLOW_ID || "";
+    if (!flowId) return false;
+    const slots = await buildUpcomingSlotOptions(a, 25);
+    if (!slots.length) { await sendText(a, c, "Abhi koi slot available nahi hai."); return true; }
+    const interactive = {
+      type: "flow",
+      body: { text: clip(node.text || "Book an appointment", 1024) },
+      action: {
+        name: "flow",
+        parameters: {
+          flow_message_version: "3",
+          flow_token: crypto.randomBytes(12).toString("hex"),
+          flow_id: flowId,
+          flow_cta: clip(node.button_text || "Book Appointment", 20),
+          flow_action: "navigate",
+          flow_action_payload: { screen: "BOOKING", data: { slots } },
+        },
+      },
+    };
+    if (node.footer) interactive.footer = { text: clip(node.footer, 60) };
+    await waSend(creds, info.number, interactive);
+    await noteSent(a, c, node.text, ["📅 Flow: " + (node.button_text || "Book Appointment")]);
+    return true;
+  } catch (e) { console.error("flowNative FAIL", e.response?.status, JSON.stringify(e.response?.data || e.message)); return false; }
+}
+
 function openConversation(a, c) { apiPost(`/api/v1/accounts/${a}/conversations/${c}/toggle_status`, { status: "open" }).catch((e) => console.error("openConversation", e.response?.data || e.message)); }
 
 async function addLabels(a, c, labels) {
@@ -611,17 +874,17 @@ async function runFlow(a, c, s, def) {
       continue;
     }
 
-    // ===== APPOINTMENT NODE =====
+    // ===== APPOINTMENT NODE — sends a WhatsApp Flow, not a browser link =====
     if (node.type === "appointment") {
-      const bookUrl = `${PUBLIC_BASE_URL}/book?aid=${a}&cid=${c}`;
-      const ok = await trySendCtaNative(a, c, {
-        body: node.text || "📅 Appointment book karein — button tap karein 👇",
-        display: (node.button_text || "Book Appointment").slice(0, 20),
-        url: bookUrl,
-        footer: node.footer || ""
-      });
-      if (!ok) await sendText(a, c, (node.text || "📅 Appointment book karein:") + "\n\n🔗 " + bookUrl);
-      nextsOf(node).forEach((x) => queue.push(x));
+      const ok = await trySendFlowNative(a, c, node);
+      if (!ok) {
+        // Fallback if no Flow ID configured yet — tell the merchant, don't silently break.
+        await sendText(a, c, (node.text || "📅 Appointment booking") + "\n\n⚠️ Flow not configured yet — set WA_APPOINTMENT_FLOW_ID or the node's flow_id.");
+      }
+      s.variables.__appt_node = id;
+      awaitNode = { type: "appointment", nodeId: id };
+      const dn = nextsOf(node);
+      if (dn.length) { s.variables.__appt_next = dn; }
       continue;
     }
 
@@ -758,6 +1021,41 @@ function resolveMenuChoice(def, s, text) {
   return null;
 }
 
+// Handle the customer's completed WhatsApp Flow submission (nfm_reply).
+// This is where the custom questions + slot double-check + Sheets row happen.
+async function handleFlowSubmission(accountId, conversationId, s, def, nfmResponse) {
+  let payload = {};
+  try { payload = typeof nfmResponse.response_json === "string" ? JSON.parse(nfmResponse.response_json) : (nfmResponse.response_json || {}); } catch (e) {}
+  const slotVal = String(payload.slot || "");
+  const [date, time] = slotVal.split("|");
+  const cfg = (await getApptSettings(accountId)) || {};
+  const questions = (cfg.questions ? (typeof cfg.questions === "string" ? JSON.parse(cfg.questions) : cfg.questions) : []).filter((q) => (q.label || "").trim());
+  const answers = {};
+  for (const q of questions) {
+    const key = q.key || q.label;
+    if (payload[key] != null) answers[key] = payload[key];
+  }
+  if (!date || !time) {
+    await sendText(accountId, conversationId, "Booking mein date/time nahi mila. Dobara try karein.");
+    return;
+  }
+  const result = await bookAppointmentInternal(accountId, { date, time, answers, convId: conversationId });
+  if (!result.ok) {
+    if (result.error === "slot_taken") await sendText(accountId, conversationId, "😔 Yeh slot abhi kisi aur ne le liya. Dobara try karein, koi aur time select karein.");
+    else await sendText(accountId, conversationId, "Booking nahi ho saki: " + (result.error || "unknown error"));
+    return;
+  }
+  const answerLines = Object.entries(answers).map(([k, v]) => `👤 ${k}: ${v}`).join("\n");
+  const msg = `✅ *Appointment Confirmed!*\n\n📅 Date: ${fmtDateLabel(date)}\n⏰ Time: ${fmtTimeLabel(time)}${answerLines ? "\n" + answerLines : ""}\n\nHum aapka intezaar karenge! 🙌`;
+  await sendText(accountId, conversationId, msg);
+  delete s.variables.__appt_node;
+  const nextIds = s.variables.__appt_next || [];
+  delete s.variables.__appt_next;
+  s.awaiting = null;
+  s.nodeId = nextIds && nextIds.length ? nextIds : null;
+  await advance(accountId, conversationId, s, def);
+}
+
 app.post("/webhook", async (req, res) => {
   res.sendStatus(200);
   try {
@@ -776,6 +1074,19 @@ app.post("/webhook", async (req, res) => {
     const def = parseDef(flowRow.definition); if (!def.start) return;
     const flowPublishedAt = new Date(flowRow.published_at).toISOString();
     const session = await getSession(accountId, conversationId);
+
+    // WhatsApp Flow completed submission arrives as a normal incoming message
+    // with content_attributes carrying the raw webhook payload; nfm_reply
+    // sits inside message.interactive.nfm_reply in Chatwoot's mirrored payload.
+    const nfm = event.content_attributes?.nfm_reply || event.additional_attributes?.nfm_reply || null;
+    if (nfm && session) {
+      const s = toSession(session, flowPublishedAt);
+      s.variables.__inbox = inboxId; Object.assign(s.variables, senderVars);
+      if (session.awaiting === "appointment") {
+        await handleFlowSubmission(accountId, conversationId, s, def, nfm);
+        return;
+      }
+    }
 
     const submitted = event.content_attributes?.submitted_values;
     if (event.event === "message_updated" && Array.isArray(submitted) && submitted.length > 0) {
@@ -820,6 +1131,12 @@ app.post("/webhook", async (req, res) => {
     s.variables.message = text;
     s.variables.__inbox = inboxId;
     Object.assign(s.variables, senderVars);
+
+    if (session.awaiting === "appointment") {
+      // Customer typed instead of completing the Flow — nudge them back to it.
+      await saveSession(accountId, conversationId, s);
+      return;
+    }
 
     if (session.awaiting === "question") {
       const node = def.nodes[session.node_id];
