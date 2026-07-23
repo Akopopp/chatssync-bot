@@ -313,13 +313,16 @@ function buildApptFlowJson(questions) {
   const qFields = mapped.map(q => ({
     type: "TextInput",
     required: true,
-    label: q.label,
+    label: (q.label || "Name").slice(0,30).replace(/[^a-zA-Z0-9 ]/g, " ").trim() || "Name",
     name: q.sanitized,
-    "input-type": ["number","email","phone"].includes(q.input_type) ? q.input_type : "text",
+    "input-type": "text",
   }));
+  const exampleSlots = [
+    { id: "slot_1", title: "20 Aug 9 AM" },
+    { id: "slot_2", title: "20 Aug 9 30 AM" }
+  ];
   return {
-    version: "7.1",
-    data_api_version: "3.0",
+    version: "5.0",
     screens: [
       {
         id: "BOOKING",
@@ -329,17 +332,14 @@ function buildApptFlowJson(questions) {
           slots: {
             type: "array",
             items: { type: "object", properties: { id: { type: "string" }, title: { type: "string" } } },
-            __example__: [
-              { id: "2025-08-20|09:00", title: "20 Aug - 09:00 AM" },
-              { id: "2025-08-20|09:30", title: "20 Aug - 09:30 AM" }
-            ]
+            __example__: exampleSlots
           }
         },
         layout: {
           type: "SingleColumnLayout",
           children: [
-            { type: "TextHeading", text: "Select date & time" },
-            { type: "Dropdown", name: "slot", label: "Date and time", required: true, "data-source": "${data.slots}" },
+            { type: "TextHeading", text: "Select date and time" },
+            { type: "Dropdown", name: "selected_slot", label: "Date and time", required: true, "data-source": "${data.slots}" },
             ...qFields,
             {
               type: "Footer",
@@ -347,7 +347,7 @@ function buildApptFlowJson(questions) {
               "on-click-action": {
                 name: "complete",
                 payload: Object.fromEntries([
-                  ["slot", "${form.slot}"],
+                  ["slot", "${form.selected_slot}"],
                   ...mapped.map(f => [f.sanitized, "${form." + f.sanitized + "}"])
                 ])
               }
@@ -358,6 +358,7 @@ function buildApptFlowJson(questions) {
     ],
   };
 }
+
 
 app.get("/api/appointments/flow-json", async (req, res) => {
   try {
@@ -372,7 +373,7 @@ app.get("/api/appointments/flow-json", async (req, res) => {
 async function graphCreateFlow(token, wabaId, name) {
   const uniqueName = ("Appt " + Date.now()).slice(0, 40);
   const r = await axios.post("https://graph.facebook.com/" + WA_VER + "/" + wabaId + "/flows",
-    { name: uniqueName, categories: ["APPOINTMENT_BOOKING"] },
+    { name: uniqueName, categories: ["OTHER"] },
     { headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" }, timeout: 20000 });
   return r.data;
 }
@@ -427,8 +428,11 @@ app.post("/api/appointments/create-flow", async (req, res) => {
       await saveApptSettings(accountId, { ...cfg, waba_id, flow_id: flowId, flow_inbox_id: inboxId, flow_status: "PUBLISHED" });
       res.json({ ok: true, flow_id: flowId, status: "PUBLISHED" });
     } catch (ge) {
-      console.error("Flow FAIL:", JSON.stringify(ge.response?.data || {}, null, 2));
-      const detail = ge.response?.data?.error?.error_user_msg || ge.response?.data?.error?.message || ge.message;
+      console.error("Flow FAIL FULL:", JSON.stringify(ge.response?.data || {}, null, 2));
+      let fullErr = ge.response?.data || {};
+      let validationFromError = fullErr.error?.error_data?.details || fullErr.error?.error_data || "";
+      console.error("Validation details:", JSON.stringify(validationFromError, null, 2));
+      const detail = ge.response?.data?.error?.error_user_msg || ge.response?.data?.error?.message || JSON.stringify(ge.response?.data?.error || {}).slice(0,1000) || ge.message;
       if (flowId) await saveApptSettings(accountId, { ...cfg, waba_id, flow_id: flowId, flow_inbox_id: inboxId, flow_status: "ERROR" });
       res.status(400).json({ error: "Meta rejected the Flow: " + detail, flow_id: flowId || null });
     }
