@@ -322,7 +322,9 @@ function buildApptFlowJson(questions) {
     { id: "slot_2", title: "20 Aug 9 30 AM" }
   ];
   return {
-    version: "5.0",
+    version: "7.1",
+    data_api_version: "3.0",
+    routing_model: { BOOKING: [] },
     screens: [
       {
         id: "BOOKING",
