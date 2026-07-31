@@ -1,4 +1,3 @@
-
 import express from "express";
 import axios from "axios";
 import http from "http";
@@ -497,9 +496,38 @@ async function apiPost(path2, body) {
 }
 async function sendText(a, c, text) { if (!text) return; try { await apiPost(`/api/v1/accounts/${a}/conversations/${c}/messages`, { content: text, message_type: "outgoing" }); } catch (e) { console.error("sendText", e.response?.data || e.message); } }
 async function sendOptions(a, c, text, titles) { try { const tl = titles || []; const maxLen = tl.length <= 3 ? 20 : 24; await apiPost(`/api/v1/accounts/${a}/conversations/${c}/messages`, { content: text || " ", message_type: "outgoing", content_type: "input_select", content_attributes: { items: tl.map((t) => { const tt = String(t).slice(0, maxLen); return { title: tt, value: tt }; }) } }); } catch (e) { console.error("sendOptions", e.response?.data || e.message); } }
+async function trySendFormListNative(a, c, field) {
+  try {
+    const info = await getConvInfo(a, c); if (!info.number || !info.inboxId) return false;
+    const creds = await getWaCreds(a, info.inboxId); if (!creds) return false;
+    const opts = (field.options || []).filter((o) => (o && o.title || "").trim()).slice(0, 10);
+    if (!opts.length) return false;
+    const rows = opts.map((o, i) => ({ id: `r${i}`, title: clip(o.title || `Option ${i + 1}`, 24) }));
+    const interactive = { type: "list", body: { text: clip(field.label || "Choose an option", 1024) }, action: { button: clip(field.list_button || "Choose", 20), sections: [{ title: "Options", rows }] } };
+    await waSend(creds, info.number, interactive);
+    await noteSent(a, c, field.label, rows.map((r) => r.title));
+    return true;
+  } catch (e) { console.error("formListNative FAIL", e.response?.status, JSON.stringify(e.response?.data || e.message)); return false; }
+}
+async function trySendFormButtonsNative(a, c, field) {
+  try {
+    const info = await getConvInfo(a, c); if (!info.number || !info.inboxId) return false;
+    const creds = await getWaCreds(a, info.inboxId); if (!creds) return false;
+    const opts = (field.options || []).filter((o) => (o && o.title || "").trim()).slice(0, 3);
+    if (!opts.length) return false;
+    const btns = opts.map((o, i) => ({ type: "reply", reply: { id: `b${i}`, title: clip(o.title || `Button ${i + 1}`, 20) } }));
+    const interactive = { type: "button", body: { text: clip(field.label || "Choose an option", 1024) }, action: { buttons: btns } };
+    await waSend(creds, info.number, interactive);
+    await noteSent(a, c, field.label, btns.map((b) => b.reply.title));
+    return true;
+  } catch (e) { console.error("formButtonsNative FAIL", e.response?.status, JSON.stringify(e.response?.data || e.message)); return false; }
+}
 async function sendFormField(a, c, field) {
   const type = (field && field.type) || "text";
-  if ((type === "list" || type === "buttons") && Array.isArray(field.options) && field.options.length) {
+  const hasOpts = Array.isArray(field.options) && field.options.filter((o) => (o && o.title || "").trim()).length;
+  if (type === "list" && hasOpts) { const ok = await trySendFormListNative(a, c, field); if (ok) return; }
+  if (type === "buttons" && hasOpts) { const ok = await trySendFormButtonsNative(a, c, field); if (ok) return; }
+  if ((type === "list" || type === "buttons") && hasOpts) {
     const titles = field.options.map((o) => (o && o.title ? String(o.title) : "")).filter(Boolean);
     if (titles.length) { await sendOptions(a, c, field.label || "Please choose:", titles); return; }
   }
