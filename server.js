@@ -914,26 +914,38 @@ app.post("/webhook", async (req, res) => {
 /* =====================================================================
    WHATSAPP TEMPLATES  —  ChatsSync
    =====================================================================
-   Builder (builder.chatssync.online) ye teen raaste maangta hai:
-       GET  /api/templates?account_id=&inbox_id=
-       GET  /api/templates/meta?account_id=&inbox_id=
-       POST /api/templates
-   Ye kabhi banaye hi nahi gaye the, isi liye 404 aata tha aur
-   "Couldn't reach the server" dikhta tha.
+   Builder (builder.chatssync.online) in raaston ko bulata hai:
+       GET    /api/templates?account_id=&inbox_id=
+       GET    /api/templates/meta?account_id=&inbox_id=
+       POST   /api/templates
+       DELETE /api/templates?...&name=
+       POST   /api/templates/upload-media   (multipart: file)
 
-   AHEM — ye hissa poori tarah ALAG hai:
+   AHEM — builder HAR jawab mein `ok: true` dhoondta hai:
+       if (j.ok) setList(j.templates); else setErr("Couldn't load...")
+   Pehle main sirf { templates: [...] } bhej raha tha, `ok` ke bagair.
+   Isi liye data aane ke BAWAJOOD builder "Couldn't load templates"
+   dikhata tha. Ab har jawab mein ok hai.
+
+   Aur builder meta se `phone` parhta hai (meta?.phone) — main
+   `phone_number` bhej raha tha, isi liye Phone aur WABA ID khali
+   dikhte the. Ab dono bhejte hain.
+
+   Ye hissa poori tarah ALAG hai:
      • koi purana route, function ya variable nahi badla
-     • sirf getWaCreds() istemal hota hai jo pehle se maujood hai
-     • kuch bhi fail ho to sirf yehi teen raaste mutasir honge —
-       chatbot, flows, appointments aur webhook jyon ke tyon
-     • har inbox ka APNA token (multi-tenant) — kisi ek WABA par
-       nahi. Token Chatwoot ke provider_config se aata hai, wahi
-       jagah jahan se chatbot apna token leta hai.
+     • multer apna alag (tplUpload) — Gallery ka `upload` nahi chhua
+     • getWaCreds() istemal hota hai jo pehle se maujood hai
+     • har inbox ka APNA token aur APNA app id (multi-tenant)
+     • kuch fail ho to sirf yehi raaste mutasir honge — chatbot,
+       flows, appointments, gallery, webhook jyon ke tyon
    ===================================================================== */
 
-/* WABA id — templates ke liye zaroori hai (phone_number_id se alag).
-   Pehle provider_config mein dekho, na mile to Meta se phone number ke
-   zariye nikaal lo. Har inbox ka alag, 10 minute cache. */
+const tplUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 60 * 1024 * 1024 },
+});
+
+/* ---- WABA id: har inbox ka apna, 10 min cache ---- */
 const wabaCache = new Map();
 
 async function getWabaId(accountId, inboxId, creds) {
@@ -943,7 +955,6 @@ async function getWabaId(accountId, inboxId, creds) {
 
   let wabaId = null;
 
-  // 1) Chatwoot ke provider_config se
   try {
     const r = await cw.get(
       `${CHATWOOT_BASE_URL}/api/v1/accounts/${accountId}/inboxes/${inboxId}`,
@@ -951,16 +962,11 @@ async function getWabaId(accountId, inboxId, creds) {
     );
     const d = r.data || {};
     const pc = d.provider_config || (d.channel && d.channel.provider_config) || {};
-    wabaId =
-      pc.business_account_id ||
-      pc.waba_id ||
-      pc.whatsapp_business_account_id ||
-      null;
+    wabaId = pc.business_account_id || pc.waba_id || pc.whatsapp_business_account_id || null;
   } catch (e) {
     /* ignore */
   }
 
-  // 2) database se
   if (!wabaId) {
     const db = await getChatwootDb();
     if (db) {
@@ -970,28 +976,20 @@ async function getWabaId(accountId, inboxId, creds) {
           [inboxId]
         );
         const pc = (q.rows[0] && q.rows[0].pc) || {};
-        wabaId =
-          pc.business_account_id ||
-          pc.waba_id ||
-          pc.whatsapp_business_account_id ||
-          null;
+        wabaId = pc.business_account_id || pc.waba_id || pc.whatsapp_business_account_id || null;
       } catch (e) {
         /* ignore */
       }
     }
   }
 
-  // 3) Meta se — phone number id se uska WABA poochho
   if (!wabaId && creds && creds.phoneId && creds.token) {
     try {
-      const r = await cw.get(
-        `https://graph.facebook.com/${WA_VER}/${creds.phoneId}`,
-        {
-          params: { fields: "whatsapp_business_account_id" },
-          headers: { Authorization: `Bearer ${creds.token}` },
-          timeout: 15000,
-        }
-      );
+      const r = await cw.get(`https://graph.facebook.com/${WA_VER}/${creds.phoneId}`, {
+        params: { fields: "whatsapp_business_account_id" },
+        headers: { Authorization: `Bearer ${creds.token}` },
+        timeout: 15000,
+      });
       wabaId = (r.data && r.data.whatsapp_business_account_id) || null;
     } catch (e) {
       /* ignore */
@@ -1002,21 +1000,47 @@ async function getWabaId(accountId, inboxId, creds) {
   return wabaId;
 }
 
-/* har route ke shuru mein yehi — account, inbox, token aur waba */
+/* ---- App id: media upload ke liye. Har client ka APNA —
+       uske apne token se poocha jaata hai, koi env var nahi ---- */
+const appIdCache = new Map();
+
+async function getAppId(token) {
+  if (!token) return null;
+  const key = token.slice(-24);
+  const hit = appIdCache.get(key);
+  if (hit && hit.exp > Date.now()) return hit.id;
+
+  let appId = null;
+  try {
+    const r = await cw.get(`https://graph.facebook.com/${WA_VER}/debug_token`, {
+      params: { input_token: token },
+      headers: { Authorization: `Bearer ${token}` },
+      timeout: 15000,
+    });
+    appId = (r.data && r.data.data && r.data.data.app_id) || null;
+  } catch (e) {
+    /* ignore */
+  }
+
+  appIdCache.set(key, { id: appId, exp: Date.now() + (appId ? 3600000 : 120000) });
+  return appId;
+}
+
+/* ---- har route ke shuru mein ---- */
 async function tplContext(req, res) {
   const accountId = parseInt(req.query.account_id || (req.body || {}).account_id, 10);
   const inboxId = parseInt(req.query.inbox_id || (req.body || {}).inbox_id, 10);
 
   if (!accountId || !inboxId) {
-    res.status(400).json({ error: "account_id aur inbox_id dono chahiye" });
+    res.status(400).json({ ok: false, error: "account_id aur inbox_id dono chahiye" });
     return null;
   }
 
   const creds = await getWaCreds(accountId, inboxId);
   if (!creds) {
     res.status(400).json({
-      error:
-        "Is inbox ka WhatsApp token nahi mila. Chatwoot mein inbox ki settings check karein.",
+      ok: false,
+      error: "Is inbox ka WhatsApp token nahi mila. Chatwoot mein inbox settings check karein.",
     });
     return null;
   }
@@ -1024,8 +1048,8 @@ async function tplContext(req, res) {
   const wabaId = await getWabaId(accountId, inboxId, creds);
   if (!wabaId) {
     res.status(400).json({
-      error:
-        "WhatsApp Business Account (WABA) id nahi mili. Inbox ke provider config mein business_account_id set karein.",
+      ok: false,
+      error: "WABA id nahi mili. Inbox ke provider config mein business_account_id set karein.",
     });
     return null;
   }
@@ -1038,13 +1062,14 @@ function metaErr(e) {
   const m = d && d.error;
   if (m) {
     return {
+      ok: false,
       error: m.error_user_msg || m.message || "Meta error",
       code: m.code,
       subcode: m.error_subcode,
       details: m.error_data && m.error_data.details,
     };
   }
-  return { error: e.message || "Unknown error" };
+  return { ok: false, error: e.message || "Unknown error" };
 }
 
 /* ---------- LIST ---------- */
@@ -1056,7 +1081,7 @@ app.get("/api/templates", async (req, res) => {
     const r = await cw.get(
       `https://graph.facebook.com/${WA_VER}/${ctx.wabaId}/message_templates`,
       {
-        params: { limit: 200 },
+        params: { limit: 250 },
         headers: { Authorization: `Bearer ${ctx.creds.token}` },
         timeout: 20000,
       }
@@ -1064,6 +1089,7 @@ app.get("/api/templates", async (req, res) => {
 
     const list = (r.data && r.data.data) || [];
     res.json({
+      ok: true,
       templates: list.map((t) => ({
         id: t.id,
         name: t.name,
@@ -1072,23 +1098,43 @@ app.get("/api/templates", async (req, res) => {
         category: t.category,
         components: t.components || [],
         rejected_reason: t.rejected_reason || null,
+        quality_score: t.quality_score || null,
       })),
     });
   } catch (e) {
     console.error("GET /api/templates", e.response?.data || e.message);
-    res.status(500).json(metaErr(e));
+    res.status(200).json(metaErr(e));
   }
 });
 
-/* ---------- META (languages, categories) ---------- */
+/* ---------- META ---------- */
 app.get("/api/templates/meta", async (req, res) => {
   try {
     const ctx = await tplContext(req, res);
     if (!ctx) return;
 
+    /* asal phone number Meta se — builder isay `phone` naam se parhta hai */
+    let phone = ctx.creds.phoneId;
+    let verifiedName = null;
+    try {
+      const r = await cw.get(`https://graph.facebook.com/${WA_VER}/${ctx.creds.phoneId}`, {
+        params: { fields: "display_phone_number,verified_name,quality_rating" },
+        headers: { Authorization: `Bearer ${ctx.creds.token}` },
+        timeout: 15000,
+      });
+      phone = (r.data && r.data.display_phone_number) || phone;
+      verifiedName = (r.data && r.data.verified_name) || null;
+    } catch (e) {
+      /* ignore */
+    }
+
     res.json({
-      waba_id: ctx.wabaId,
+      ok: true,
+      phone,
+      phone_number: phone,
       phone_number_id: ctx.creds.phoneId,
+      waba_id: ctx.wabaId,
+      verified_name: verifiedName,
       categories: ["MARKETING", "UTILITY", "AUTHENTICATION"],
       languages: [
         { code: "en", name: "English" },
@@ -1103,7 +1149,60 @@ app.get("/api/templates/meta", async (req, res) => {
     });
   } catch (e) {
     console.error("GET /api/templates/meta", e.response?.data || e.message);
-    res.status(500).json(metaErr(e));
+    res.status(200).json(metaErr(e));
+  }
+});
+
+/* ---------- MEDIA UPLOAD (header ke sample ke liye) ----------
+   Meta ka resumable upload. App id har client ka apna — uske token se. */
+app.post("/api/templates/upload-media", tplUpload.single("file"), async (req, res) => {
+  try {
+    const ctx = await tplContext(req, res);
+    if (!ctx) return;
+
+    if (!req.file) return res.json({ ok: false, error: "file chahiye" });
+
+    const appId = await getAppId(ctx.creds.token);
+    if (!appId) {
+      return res.json({
+        ok: false,
+        error: "Meta App id nahi mili — is token ke saath media upload nahi ho sakta.",
+      });
+    }
+
+    const buf = req.file.buffer;
+    const mime = req.file.mimetype || "application/octet-stream";
+
+    const start = await cw.post(
+      `https://graph.facebook.com/${WA_VER}/${appId}/uploads`,
+      null,
+      {
+        params: { file_length: buf.length, file_type: mime },
+        headers: { Authorization: `Bearer ${ctx.creds.token}` },
+        timeout: 20000,
+      }
+    );
+    const sessionId = start.data && start.data.id;
+    if (!sessionId) return res.json({ ok: false, error: "Upload session nahi bani" });
+
+    const fin = await cw.post(`https://graph.facebook.com/${WA_VER}/${sessionId}`, buf, {
+      headers: {
+        Authorization: `OAuth ${ctx.creds.token}`,
+        file_offset: "0",
+        "Content-Type": mime,
+      },
+      maxBodyLength: Infinity,
+      maxContentLength: Infinity,
+      timeout: 120000,
+    });
+
+    const handle = fin.data && fin.data.h;
+    if (!handle) return res.json({ ok: false, error: "Meta ne handle nahi diya" });
+
+    res.json({ ok: true, handle, name: req.file.originalname });
+  } catch (e) {
+    console.error("POST /api/templates/upload-media", e.response?.data || e.message);
+    res.status(200).json(metaErr(e));
   }
 });
 
@@ -1115,63 +1214,117 @@ app.post("/api/templates", async (req, res) => {
 
     const b = req.body || {};
     const name = String(b.name || "").trim().toLowerCase().replace(/[^a-z0-9_]/g, "_");
-    if (!name) return res.status(400).json({ error: "name chahiye" });
+    if (!name) return res.json({ ok: false, error: "name chahiye" });
 
-    /* Builder do shakl bhej sakta hai: ya to poore `components`, ya
-       alag alag hisse (header/body/footer/buttons). Dono sambhal lete
-       hain taake builder ki taraf kuch badalna na pade. */
+    const category = String(b.category || "UTILITY").toUpperCase();
+    const language = b.language || "en";
+
     let components = Array.isArray(b.components) ? b.components : null;
 
     if (!components) {
       components = [];
 
-      const h = b.header || {};
-      const hType = String(h.type || b.header_type || "NONE").toUpperCase();
-      if (hType === "TEXT" && (h.text || b.header_text)) {
-        const comp = { type: "HEADER", format: "TEXT", text: String(h.text || b.header_text) };
-        if (Array.isArray(h.example) && h.example.length)
-          comp.example = { header_text: h.example };
-        components.push(comp);
-      } else if (["IMAGE", "VIDEO", "DOCUMENT"].includes(hType)) {
-        const handle = h.handle || h.url || b.header_handle;
-        const comp = { type: "HEADER", format: hType };
-        if (handle) comp.example = { header_handle: [handle] };
-        components.push(comp);
-      }
+      /* ---- AUTHENTICATION: Meta khud sab banata hai ---- */
+      if (category === "AUTHENTICATION") {
+        const bodyComp = { type: "BODY" };
+        if (b.add_security_recommendation) bodyComp.add_security_recommendation = true;
+        components.push(bodyComp);
 
-      const bodyText = b.body_text || (b.body && b.body.text) || b.text || "";
-      if (!bodyText) return res.status(400).json({ error: "body ka text chahiye" });
-      const bodyComp = { type: "BODY", text: String(bodyText) };
-      const bodyEx = (b.body && b.body.example) || b.body_example;
-      if (Array.isArray(bodyEx) && bodyEx.length)
-        bodyComp.example = { body_text: [bodyEx] };
-      components.push(bodyComp);
+        if (b.code_expiration_minutes) {
+          components.push({
+            type: "FOOTER",
+            code_expiration_minutes: parseInt(b.code_expiration_minutes, 10),
+          });
+        }
 
-      const footer = b.footer_text || (b.footer && b.footer.text);
-      if (footer) components.push({ type: "FOOTER", text: String(footer) });
-
-      const btns = b.buttons || [];
-      if (Array.isArray(btns) && btns.length) {
         components.push({
           type: "BUTTONS",
-          buttons: btns.map((x) => {
-            const t = String(x.type || "QUICK_REPLY").toUpperCase();
-            if (t === "URL")
-              return { type: "URL", text: x.text, url: x.url };
-            if (t === "PHONE_NUMBER")
-              return { type: "PHONE_NUMBER", text: x.text, phone_number: x.phone_number };
-            return { type: "QUICK_REPLY", text: x.text };
-          }),
+          buttons: [{ type: "OTP", otp_type: "COPY_CODE", text: b.button_text || "Copy Code" }],
         });
+      } else {
+        /* ---- HEADER ---- */
+        const h = b.header || {};
+        const hType = String(h.type || b.header_type || "NONE").toUpperCase();
+
+        if (hType === "TEXT" && (h.text || b.header_text)) {
+          const comp = { type: "HEADER", format: "TEXT", text: String(h.text || b.header_text) };
+          const ex = h.example || b.header_example;
+          if (Array.isArray(ex) && ex.length) comp.example = { header_text: ex };
+          components.push(comp);
+        } else if (["IMAGE", "VIDEO", "DOCUMENT"].includes(hType)) {
+          const handle = h.handle || b.header_handle;
+          const comp = { type: "HEADER", format: hType };
+          if (handle) comp.example = { header_handle: [handle] };
+          components.push(comp);
+        }
+
+        /* ---- BODY ---- */
+        const cards = Array.isArray(b.cards) ? b.cards : [];
+        const bodyText = b.body_text || (b.body && b.body.text) || b.text || "";
+        if (!bodyText && !cards.length) {
+          return res.json({ ok: false, error: "body ka text chahiye" });
+        }
+        if (bodyText) {
+          const bodyComp = { type: "BODY", text: String(bodyText) };
+          const bodyEx = b.body_example || (b.body && b.body.example);
+          if (Array.isArray(bodyEx) && bodyEx.length) {
+            bodyComp.example = { body_text: [bodyEx] };
+          }
+          components.push(bodyComp);
+        }
+
+        /* ---- FOOTER ---- */
+        const footer = b.footer_text || (b.footer && b.footer.text);
+        if (footer) components.push({ type: "FOOTER", text: String(footer) });
+
+        /* ---- BUTTONS ---- */
+        const btns = Array.isArray(b.buttons) ? b.buttons : [];
+        if (btns.length) {
+          components.push({
+            type: "BUTTONS",
+            buttons: btns.map((x) => {
+              const t = String(x.type || "QUICK_REPLY").toUpperCase();
+              if (t === "URL") return { type: "URL", text: x.text, url: x.url };
+              if (t === "PHONE_NUMBER")
+                return { type: "PHONE_NUMBER", text: x.text, phone_number: x.phone_number };
+              return { type: "QUICK_REPLY", text: x.text };
+            }),
+          });
+        }
+
+        /* ---- CAROUSEL ---- */
+        if (cards.length) {
+          components.push({
+            type: "CAROUSEL",
+            cards: cards.map((c) => {
+              const cc = [];
+              const ct = String(c.header_type || "IMAGE").toUpperCase();
+              const chandle = c.header_handle;
+              const hc = { type: "HEADER", format: ct };
+              if (chandle) hc.example = { header_handle: [chandle] };
+              cc.push(hc);
+              cc.push({ type: "BODY", text: String(c.body_text || "") });
+              const cb = Array.isArray(c.buttons) ? c.buttons : [];
+              if (cb.length) {
+                cc.push({
+                  type: "BUTTONS",
+                  buttons: cb.map((x) => {
+                    const t = String(x.type || "QUICK_REPLY").toUpperCase();
+                    if (t === "URL") return { type: "URL", text: x.text, url: x.url };
+                    if (t === "PHONE_NUMBER")
+                      return { type: "PHONE_NUMBER", text: x.text, phone_number: x.phone_number };
+                    return { type: "QUICK_REPLY", text: x.text };
+                  }),
+                });
+              }
+              return { components: cc };
+            }),
+          });
+        }
       }
     }
 
-    const payload = {
-      name,
-      language: b.language || "en",
-      category: String(b.category || "UTILITY").toUpperCase(),
-      components,
-    };
+    const payload = { name, language, category, components };
 
     const r = await cw.post(
       `https://graph.facebook.com/${WA_VER}/${ctx.wabaId}/message_templates`,
@@ -1188,7 +1341,7 @@ app.post("/api/templates", async (req, res) => {
     res.json({ ok: true, template: r.data });
   } catch (e) {
     console.error("POST /api/templates", e.response?.data || e.message);
-    res.status(400).json(metaErr(e));
+    res.status(200).json(metaErr(e));
   }
 });
 
@@ -1199,7 +1352,7 @@ app.delete("/api/templates", async (req, res) => {
     if (!ctx) return;
 
     const name = String(req.query.name || (req.body || {}).name || "").trim();
-    if (!name) return res.status(400).json({ error: "name chahiye" });
+    if (!name) return res.json({ ok: false, error: "name chahiye" });
 
     const r = await cw.delete(
       `https://graph.facebook.com/${WA_VER}/${ctx.wabaId}/message_templates`,
@@ -1213,7 +1366,7 @@ app.delete("/api/templates", async (req, res) => {
     res.json({ ok: true, result: r.data });
   } catch (e) {
     console.error("DELETE /api/templates", e.response?.data || e.message);
-    res.status(400).json(metaErr(e));
+    res.status(200).json(metaErr(e));
   }
 });
 
