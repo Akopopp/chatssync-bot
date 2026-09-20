@@ -911,6 +911,312 @@ app.post("/webhook", async (req, res) => {
   } catch (e) { console.error("webhook error:", e.message); }
 });
 
+/* =====================================================================
+   WHATSAPP TEMPLATES  —  ChatsSync
+   =====================================================================
+   Builder (builder.chatssync.online) ye teen raaste maangta hai:
+       GET  /api/templates?account_id=&inbox_id=
+       GET  /api/templates/meta?account_id=&inbox_id=
+       POST /api/templates
+   Ye kabhi banaye hi nahi gaye the, isi liye 404 aata tha aur
+   "Couldn't reach the server" dikhta tha.
+
+   AHEM — ye hissa poori tarah ALAG hai:
+     • koi purana route, function ya variable nahi badla
+     • sirf getWaCreds() istemal hota hai jo pehle se maujood hai
+     • kuch bhi fail ho to sirf yehi teen raaste mutasir honge —
+       chatbot, flows, appointments aur webhook jyon ke tyon
+     • har inbox ka APNA token (multi-tenant) — kisi ek WABA par
+       nahi. Token Chatwoot ke provider_config se aata hai, wahi
+       jagah jahan se chatbot apna token leta hai.
+   ===================================================================== */
+
+/* WABA id — templates ke liye zaroori hai (phone_number_id se alag).
+   Pehle provider_config mein dekho, na mile to Meta se phone number ke
+   zariye nikaal lo. Har inbox ka alag, 10 minute cache. */
+const wabaCache = new Map();
+
+async function getWabaId(accountId, inboxId, creds) {
+  const key = `${accountId}:${inboxId}`;
+  const hit = wabaCache.get(key);
+  if (hit && hit.exp > Date.now()) return hit.id;
+
+  let wabaId = null;
+
+  // 1) Chatwoot ke provider_config se
+  try {
+    const r = await cw.get(
+      `${CHATWOOT_BASE_URL}/api/v1/accounts/${accountId}/inboxes/${inboxId}`,
+      { headers: { api_access_token: ADMIN_TOKEN }, timeout: 12000 }
+    );
+    const d = r.data || {};
+    const pc = d.provider_config || (d.channel && d.channel.provider_config) || {};
+    wabaId =
+      pc.business_account_id ||
+      pc.waba_id ||
+      pc.whatsapp_business_account_id ||
+      null;
+  } catch (e) {
+    /* ignore */
+  }
+
+  // 2) database se
+  if (!wabaId) {
+    const db = await getChatwootDb();
+    if (db) {
+      try {
+        const q = await db.query(
+          "SELECT cw.provider_config AS pc FROM channel_whatsapp cw JOIN inboxes i ON i.channel_id = cw.id WHERE i.id = $1 AND i.channel_type = 'Channel::Whatsapp' LIMIT 1",
+          [inboxId]
+        );
+        const pc = (q.rows[0] && q.rows[0].pc) || {};
+        wabaId =
+          pc.business_account_id ||
+          pc.waba_id ||
+          pc.whatsapp_business_account_id ||
+          null;
+      } catch (e) {
+        /* ignore */
+      }
+    }
+  }
+
+  // 3) Meta se — phone number id se uska WABA poochho
+  if (!wabaId && creds && creds.phoneId && creds.token) {
+    try {
+      const r = await cw.get(
+        `https://graph.facebook.com/${WA_VER}/${creds.phoneId}`,
+        {
+          params: { fields: "whatsapp_business_account_id" },
+          headers: { Authorization: `Bearer ${creds.token}` },
+          timeout: 15000,
+        }
+      );
+      wabaId = (r.data && r.data.whatsapp_business_account_id) || null;
+    } catch (e) {
+      /* ignore */
+    }
+  }
+
+  wabaCache.set(key, { id: wabaId, exp: Date.now() + (wabaId ? 600000 : 120000) });
+  return wabaId;
+}
+
+/* har route ke shuru mein yehi — account, inbox, token aur waba */
+async function tplContext(req, res) {
+  const accountId = parseInt(req.query.account_id || (req.body || {}).account_id, 10);
+  const inboxId = parseInt(req.query.inbox_id || (req.body || {}).inbox_id, 10);
+
+  if (!accountId || !inboxId) {
+    res.status(400).json({ error: "account_id aur inbox_id dono chahiye" });
+    return null;
+  }
+
+  const creds = await getWaCreds(accountId, inboxId);
+  if (!creds) {
+    res.status(400).json({
+      error:
+        "Is inbox ka WhatsApp token nahi mila. Chatwoot mein inbox ki settings check karein.",
+    });
+    return null;
+  }
+
+  const wabaId = await getWabaId(accountId, inboxId, creds);
+  if (!wabaId) {
+    res.status(400).json({
+      error:
+        "WhatsApp Business Account (WABA) id nahi mili. Inbox ke provider config mein business_account_id set karein.",
+    });
+    return null;
+  }
+
+  return { accountId, inboxId, creds, wabaId };
+}
+
+function metaErr(e) {
+  const d = e.response && e.response.data;
+  const m = d && d.error;
+  if (m) {
+    return {
+      error: m.error_user_msg || m.message || "Meta error",
+      code: m.code,
+      subcode: m.error_subcode,
+      details: m.error_data && m.error_data.details,
+    };
+  }
+  return { error: e.message || "Unknown error" };
+}
+
+/* ---------- LIST ---------- */
+app.get("/api/templates", async (req, res) => {
+  try {
+    const ctx = await tplContext(req, res);
+    if (!ctx) return;
+
+    const r = await cw.get(
+      `https://graph.facebook.com/${WA_VER}/${ctx.wabaId}/message_templates`,
+      {
+        params: { limit: 200 },
+        headers: { Authorization: `Bearer ${ctx.creds.token}` },
+        timeout: 20000,
+      }
+    );
+
+    const list = (r.data && r.data.data) || [];
+    res.json({
+      templates: list.map((t) => ({
+        id: t.id,
+        name: t.name,
+        language: t.language,
+        status: t.status,
+        category: t.category,
+        components: t.components || [],
+        rejected_reason: t.rejected_reason || null,
+      })),
+    });
+  } catch (e) {
+    console.error("GET /api/templates", e.response?.data || e.message);
+    res.status(500).json(metaErr(e));
+  }
+});
+
+/* ---------- META (languages, categories) ---------- */
+app.get("/api/templates/meta", async (req, res) => {
+  try {
+    const ctx = await tplContext(req, res);
+    if (!ctx) return;
+
+    res.json({
+      waba_id: ctx.wabaId,
+      phone_number_id: ctx.creds.phoneId,
+      categories: ["MARKETING", "UTILITY", "AUTHENTICATION"],
+      languages: [
+        { code: "en", name: "English" },
+        { code: "en_US", name: "English (US)" },
+        { code: "en_GB", name: "English (UK)" },
+        { code: "ur", name: "Urdu" },
+        { code: "ar", name: "Arabic" },
+        { code: "hi", name: "Hindi" },
+      ],
+      header_types: ["NONE", "TEXT", "IMAGE", "VIDEO", "DOCUMENT"],
+      button_types: ["QUICK_REPLY", "URL", "PHONE_NUMBER"],
+    });
+  } catch (e) {
+    console.error("GET /api/templates/meta", e.response?.data || e.message);
+    res.status(500).json(metaErr(e));
+  }
+});
+
+/* ---------- CREATE ---------- */
+app.post("/api/templates", async (req, res) => {
+  try {
+    const ctx = await tplContext(req, res);
+    if (!ctx) return;
+
+    const b = req.body || {};
+    const name = String(b.name || "").trim().toLowerCase().replace(/[^a-z0-9_]/g, "_");
+    if (!name) return res.status(400).json({ error: "name chahiye" });
+
+    /* Builder do shakl bhej sakta hai: ya to poore `components`, ya
+       alag alag hisse (header/body/footer/buttons). Dono sambhal lete
+       hain taake builder ki taraf kuch badalna na pade. */
+    let components = Array.isArray(b.components) ? b.components : null;
+
+    if (!components) {
+      components = [];
+
+      const h = b.header || {};
+      const hType = String(h.type || b.header_type || "NONE").toUpperCase();
+      if (hType === "TEXT" && (h.text || b.header_text)) {
+        const comp = { type: "HEADER", format: "TEXT", text: String(h.text || b.header_text) };
+        if (Array.isArray(h.example) && h.example.length)
+          comp.example = { header_text: h.example };
+        components.push(comp);
+      } else if (["IMAGE", "VIDEO", "DOCUMENT"].includes(hType)) {
+        const handle = h.handle || h.url || b.header_handle;
+        const comp = { type: "HEADER", format: hType };
+        if (handle) comp.example = { header_handle: [handle] };
+        components.push(comp);
+      }
+
+      const bodyText = b.body_text || (b.body && b.body.text) || b.text || "";
+      if (!bodyText) return res.status(400).json({ error: "body ka text chahiye" });
+      const bodyComp = { type: "BODY", text: String(bodyText) };
+      const bodyEx = (b.body && b.body.example) || b.body_example;
+      if (Array.isArray(bodyEx) && bodyEx.length)
+        bodyComp.example = { body_text: [bodyEx] };
+      components.push(bodyComp);
+
+      const footer = b.footer_text || (b.footer && b.footer.text);
+      if (footer) components.push({ type: "FOOTER", text: String(footer) });
+
+      const btns = b.buttons || [];
+      if (Array.isArray(btns) && btns.length) {
+        components.push({
+          type: "BUTTONS",
+          buttons: btns.map((x) => {
+            const t = String(x.type || "QUICK_REPLY").toUpperCase();
+            if (t === "URL")
+              return { type: "URL", text: x.text, url: x.url };
+            if (t === "PHONE_NUMBER")
+              return { type: "PHONE_NUMBER", text: x.text, phone_number: x.phone_number };
+            return { type: "QUICK_REPLY", text: x.text };
+          }),
+        });
+      }
+    }
+
+    const payload = {
+      name,
+      language: b.language || "en",
+      category: String(b.category || "UTILITY").toUpperCase(),
+      components,
+    };
+
+    const r = await cw.post(
+      `https://graph.facebook.com/${WA_VER}/${ctx.wabaId}/message_templates`,
+      payload,
+      {
+        headers: {
+          Authorization: `Bearer ${ctx.creds.token}`,
+          "Content-Type": "application/json",
+        },
+        timeout: 25000,
+      }
+    );
+
+    res.json({ ok: true, template: r.data });
+  } catch (e) {
+    console.error("POST /api/templates", e.response?.data || e.message);
+    res.status(400).json(metaErr(e));
+  }
+});
+
+/* ---------- DELETE ---------- */
+app.delete("/api/templates", async (req, res) => {
+  try {
+    const ctx = await tplContext(req, res);
+    if (!ctx) return;
+
+    const name = String(req.query.name || (req.body || {}).name || "").trim();
+    if (!name) return res.status(400).json({ error: "name chahiye" });
+
+    const r = await cw.delete(
+      `https://graph.facebook.com/${WA_VER}/${ctx.wabaId}/message_templates`,
+      {
+        params: { name },
+        headers: { Authorization: `Bearer ${ctx.creds.token}` },
+        timeout: 20000,
+      }
+    );
+
+    res.json({ ok: true, result: r.data });
+  } catch (e) {
+    console.error("DELETE /api/templates", e.response?.data || e.message);
+    res.status(400).json(metaErr(e));
+  }
+});
+
 async function start() {
   await initDb();
   await seedFlowIfEmpty(3, seedFlow);
