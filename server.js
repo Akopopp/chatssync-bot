@@ -99,10 +99,55 @@ app.use(express.json({ limit: "2mb" }));
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-  res.header("Access-Control-Allow-Headers", "Content-Type");
+  res.header("Access-Control-Allow-Headers", "Content-Type, X-CS-Token, X-CS-Account, X-CS-Service-Key");
   if (req.method === "OPTIONS") return res.sendStatus(200);
   next();
 });
+
+/* ===== API access check =====
+   Every /api call must prove it may act for the account:
+   - the builder sends the signed-in ChatsSync user's token (X-CS-Token) and account (X-CS-Account);
+     the token is checked with ChatsSync once and remembered for 5 minutes;
+   - ChatsSync's own server (Copilot) sends the user's token the same way, or a shared BOT_SERVICE_KEY.
+   Customer booking pages (/api/calendar, appointment slots/dates) stay public.
+   The check is on by default; BOT_AUTH_REQUIRED=false only logs failures (emergency switch). */
+const SERVICE_KEY = process.env.BOT_SERVICE_KEY || "";
+const AUTH_REQUIRED = process.env.BOT_AUTH_REQUIRED !== "false";
+const PUBLIC_API = [/^\/api\/calendar\//, /^\/api\/appointments\/(slots|dates)/];
+const authCache = new Map();
+async function userIsAccountAdmin(token, accountId) {
+  const key = token + ":" + accountId; const now = Date.now(); const c = authCache.get(key);
+  if (c && c.exp > now) return c.ok;
+  let ok = false;
+  try {
+    const r = await cw.get(`${CHATWOOT_BASE_URL}/api/v1/profile`, { headers: { api_access_token: token } });
+    ok = (r.data?.accounts || []).some((a) => a.id === accountId && a.role === "administrator");
+  } catch (e) { ok = false; }
+  authCache.set(key, { ok, exp: now + 5 * 60 * 1000 });
+  return ok;
+}
+app.use("/api", async (req, res, next) => {
+  if (PUBLIC_API.some((re) => re.test(req.originalUrl))) return next();
+  const accountId = parseInt(req.get("X-CS-Account") || req.query.account_id || (req.body || {}).account_id, 10);
+  if (SERVICE_KEY && req.get("X-CS-Service-Key") === SERVICE_KEY) { req.csAccountId = accountId || null; return next(); }
+  const token = req.get("X-CS-Token") || "";
+  if (accountId && token && (await userIsAccountAdmin(token, accountId))) {
+    const claimed = [req.query.account_id, (req.body || {}).account_id].filter((v) => v != null && v !== "").map((v) => parseInt(v, 10));
+    if (claimed.some((v) => v !== accountId)) return res.status(403).json({ error: "forbidden" });
+    req.csAccountId = accountId; return next();
+  }
+  if (!AUTH_REQUIRED) { console.warn("API call without valid access", req.method, req.originalUrl); return next(); }
+  return res.status(401).json({ error: "unauthorized" });
+});
+// A flow or file may only be read or changed for the account that owns it.
+async function ownsRow(req, res, next, getRow) {
+  if (!req.csAccountId) return AUTH_REQUIRED && !req.get("X-CS-Service-Key") ? res.status(401).json({ error: "unauthorized" }) : next();
+  const row = await getRow(parseInt(req.params.id, 10));
+  if (row && row.account_id !== req.csAccountId) return res.status(404).json({ error: "not found" });
+  next();
+}
+app.use("/api/flows/:id", (req, res, next) => ownsRow(req, res, next, getFlowById).catch(next));
+app.use("/api/media/:id", (req, res, next) => ownsRow(req, res, next, getMedia).catch(next));
 app.use("/uploads", express.static(UPLOAD_DIR));
 app.use(express.static("public"));
 app.get("/", (req, res) => res.send("ChatsSync bot engine is running"));
@@ -118,7 +163,7 @@ function fileUrl(req, filename) { return PUBLIC_BASE_URL ? `${PUBLIC_BASE_URL}/u
 
 app.post("/api/upload", upload.single("file"), async (req, res) => {
   try {
-    const accountId = parseInt(req.body.account_id || req.query.account_id, 10);
+    const accountId = req.csAccountId || parseInt(req.body.account_id || req.query.account_id, 10);
     if (!accountId) return res.status(400).json({ error: "account_id required" });
     if (!req.file) return res.status(400).json({ error: "file required" });
     const url = fileUrl(req, req.file.filename);
@@ -457,7 +502,7 @@ app.get("/api/appointments/flow-status", async (req, res) => {
 
 app.get("/api/appointments/bookings", async (req, res) => {
   try {
-    const accountId = parseInt(req.query.account_id, 10);
+    const accountId = req.csAccountId || parseInt(req.query.account_id, 10);
     if (!accountId) return res.status(400).json({ error: "account_id required" });
     const date = req.query.date || null;
     res.json({ ok: true, bookings: await listApptBookings(accountId, date) });
