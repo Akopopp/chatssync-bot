@@ -985,6 +985,18 @@ function boxSummary(id, node) {
   const options = node.type === "buttons" ? (node.buttons || []).map((b) => b && b.title) : node.type === "list" ? listRows(node).map((r) => r && r.title) : node.type === "catalog" ? (node.products || []).map((p) => p && p.name) : [];
   return { id, type: node.type, text: String(text).replace(/\s+/g, " ").trim().slice(0, 220), options: options.filter(Boolean).slice(0, 10) };
 }
+// The boxes the flow sends on its own when it starts (its welcome), up to the first box that waits for the customer.
+// ChatsSync offers these to the AI only before anything was sent in a chat, so the welcome is never repeated mid-chat.
+function welcomeIds(def) {
+  const ids = new Set(); const queue = [def.start]; const nodes = def.nodes || {};
+  while (queue.length && ids.size < 30) {
+    const id = queue.shift(); const n = id && nodes[id]; if (!n || ids.has(id)) continue; ids.add(id);
+    const auto = ["text", "media", "cta", "tag", "delay"].includes(n.type) || ((n.type === "buttons" || n.type === "list") && n.next);
+    const nexts = auto ? [n.next] : n.type === "condition" ? [n.next_true, n.next_false] : [];
+    nexts.flat().forEach((x) => x && queue.push(x));
+  }
+  return ids;
+}
 // True when the flow reached a "Talk to a human" box during this call, so ChatsSync stops the AI in this chat.
 async function handedOverSince(a, c, started) { const row = await getSession(a, c); if (!row) return false; const v = typeof row.variables === "string" ? JSON.parse(row.variables) : (row.variables || {}); return (v.__handover_at || 0) >= started; }
 app.use("/api/ai", (req, res, next) => (req.csAccountId ? next() : res.status(401).json({ error: "unauthorized" })));
@@ -992,7 +1004,8 @@ app.get("/api/ai/boxes", async (req, res) => {
   try {
     const flowRow = await cachedPublishedFlow(req.csAccountId, parseInt(req.query.inbox_id, 10)); if (!flowRow) return res.json({ boxes: [] });
     const def = parseDef(flowRow.definition);
-    const boxes = Object.entries(def.nodes || {}).filter(([, n]) => n && AI_BOX_TYPES.includes(n.type)).map(([id, n]) => boxSummary(id, n)).filter((b) => b.text || b.options.length);
+    const welcome = welcomeIds(def);
+    const boxes = Object.entries(def.nodes || {}).filter(([, n]) => n && AI_BOX_TYPES.includes(n.type)).map(([id, n]) => ({ ...boxSummary(id, n), welcome: welcome.has(id) })).filter((b) => b.text || b.options.length);
     res.json({ flow: flowRow.name, boxes: boxes.slice(0, 60) });
   } catch (e) { console.error("ai/boxes", e.message); res.status(500).json({ error: e.message }); }
 });
