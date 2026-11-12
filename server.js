@@ -846,7 +846,7 @@ async function runFlow(a, c, s, def) {
     if (node.type === "media") { await sendMedia(a, c, node.url, node.caption); nextsOf(node).forEach((x) => queue.push(x)); continue; }
     if (node.type === "cta") { const okc = await trySendCtaNative(a, c, node); if (!okc) { await sendHeaderMedia(a, c, node); await sendText(a, c, ctaText(node)); } nextsOf(node).forEach((x) => queue.push(x)); continue; }
     if (node.type === "tag") { await addLabels(a, c, node.labels || []); nextsOf(node).forEach((x) => queue.push(x)); continue; }
-    if (node.type === "handover") { if (node.text) await sendText(a, c, node.text); openConversation(a, c); continue; }
+    if (node.type === "handover") { if (node.text) await sendText(a, c, node.text); openConversation(a, c); if (s.variables) s.variables.__handover_at = Date.now(); continue; }
     if (node.type === "condition") { const ok = evalConditionNode(node, s.variables || {}); const t = ok ? node.next_true : node.next_false; (Array.isArray(t) ? t : (t ? [t] : [])).forEach((x) => x && queue.push(x)); continue; }
     if (node.type === "delay") { const secs = Math.max(0, Math.min(parseInt(node.seconds, 10) || 0, 86400)); if (secs <= 0) { nextsOf(node).forEach((x) => queue.push(x)); continue; } delayNode = { nodeId: id, next: (Array.isArray(node.next) ? node.next : (node.next || null)), secs }; continue; }
     if (node.type === "appointment") { const ok = await trySendFlowNative(a, c, node); if (!ok) await sendText(a, c, (node.text || "📅 Appointment booking") + "\n\n⚠ Flow not configured yet."); s.variables.__appt_node = id; awaitNode = { type: "appointment", nodeId: id }; const dn = nextsOf(node); if (dn.length) s.variables.__appt_next = dn; continue; }
@@ -879,16 +879,18 @@ function scheduleQuestionTimeout(a, c, s, def) {
     try { const cur = await getSession(a, c); if (!cur || cur.awaiting !== "question") return; const vars = typeof cur.variables === "string" ? JSON.parse(cur.variables) : (cur.variables || {}); if (vars.__q_token !== token) return; const ns = toSession(cur, s.flowPublishedAt); if (node.timeout_message) await sendText(a, c, node.timeout_message); if (node.continue_on_timeout) { ns.awaiting = null; ns.nodeId = node.next || null; await runFlow(a, c, ns, def); } else { ns.awaiting = null; ns.nodeId = null; } await saveSession(a, c, ns); } catch (e) { console.error("qtimeout", e.message); }
   }, ms);
 }
-function matchChoice(node, choice) {
+function matchChoice(node, choice, allowNum = true) {
   const t = norm(choice); if (!node) return null; const raw = String(choice).trim();
-  const byNum = (arr) => { if (/^\d+$/.test(raw)) { const n = parseInt(raw, 10); if (n >= 1 && n <= arr.length) return arr[n - 1]; } return null; };
+  const byNum = (arr) => { if (allowNum && /^\d+$/.test(raw)) { const n = parseInt(raw, 10); if (n >= 1 && n <= arr.length) return arr[n - 1]; } return null; };
   if (node.type === "buttons") { const arr = node.buttons || []; const hit = byNum(arr) || arr.find((x) => norm(x.title) === t); return hit ? (hit.next || null) : null; }
   if (node.type === "list") { const arr = listRows(node); const hit = byNum(arr) || arr.find((x) => norm(x.title) === t); return hit ? (hit.next || null) : null; }
   return null;
 }
-function resolveMenuChoice(def, s, text) {
-  const vars = s.variables || {}; const order = []; if (s.awaiting === "buttons" || s.awaiting === "list") order.push(s.nodeId); if (vars.__opts) order.push(vars.__opts); const menus = vars.__menus || []; for (let i = menus.length - 1; i >= 0; i--) order.push(menus[i]); const tried = new Set();
-  for (const id of order) { if (id == null || tried.has(id)) continue; tried.add(id); const next = matchChoice(def.nodes[id], text); if (next) return { menuId: id, next }; }
+// strict (when the AI also answers the chat): a bare number only picks from a numbered text menu that is waiting
+// right now, so a customer typing "2" to the AI does not press an old menu button.
+function resolveMenuChoice(def, s, text, strict = false) {
+  const vars = s.variables || {}; const waiting = s.awaiting === "buttons" || s.awaiting === "list"; const order = []; if (waiting) order.push(s.nodeId); if (vars.__opts) order.push(vars.__opts); const menus = vars.__menus || []; for (let i = menus.length - 1; i >= 0; i--) order.push(menus[i]); const tried = new Set();
+  for (const id of order) { if (id == null || tried.has(id)) continue; tried.add(id); const node = def.nodes[id]; const allowNum = !strict || (waiting && id === s.nodeId && !!(node && node.text_menu)); const next = matchChoice(node, text, allowNum); if (next) return { menuId: id, next }; }
   return null;
 }
 async function handleFlowSubmission(accountId, conversationId, s, def, nfmResponse) {
@@ -906,10 +908,45 @@ async function handleFlowSubmission(accountId, conversationId, s, def, nfmRespon
   await sendText(accountId, conversationId, msg);
   delete s.variables.__appt_node; const nextIds = s.variables.__appt_next || []; delete s.variables.__appt_next; s.awaiting = null; s.nodeId = nextIds && nextIds.length ? nextIds : null; await advance(accountId, conversationId, s, def);
 }
+// What the flow does with a customer's text message. mode "full": everything (the bot runs the chat on its own).
+// mode "input": only flow answers (button taps, flow questions, forms and catalog steps, trigger words); any other
+// message is left to the ChatsSync AI. Returns true when the flow used the message.
+async function handleIncoming(accountId, conversationId, inboxId, text, senderVars, mode = "full") {
+  const flowRow = await cachedPublishedFlow(accountId, inboxId); if (!flowRow) return false; const def = parseDef(flowRow.definition); if (!def.start) return false;
+  const flowPublishedAt = new Date(flowRow.published_at).toISOString(); const session = await getSession(accountId, conversationId); const input = mode === "input";
+    const isRepublished = session && session.flow_published_at && new Date(session.flow_published_at).getTime() < new Date(flowPublishedAt).getTime();
+    if (!session || isRepublished) { const trig = def.trigger || {}; const hasKeywords = !!(trig.keywords && trig.keywords.length); if (input && !hasKeywords) return false; if (hasKeywords && !matchKeywords(text, trig.keywords, trig.fuzzy, trig.sensitivity)) return false; openConversation(accountId, conversationId); const s = { nodeId: def.start, awaiting: null, variables: { last_message: text, message: text, __inbox: inboxId, ...senderVars }, flowPublishedAt }; await advance(accountId, conversationId, s, def); return true; }
+    const s = toSession(session, flowPublishedAt); s.variables.last_message = text; s.variables.message = text; s.variables.__inbox = inboxId; Object.assign(s.variables, senderVars);
+    if (session.awaiting === "appointment") { if (input) return false; await saveSession(accountId, conversationId, s); return true; }
+    if (session.awaiting === "question") { const node = def.nodes[session.node_id]; if (node && node.response_format && !validateFormat(text, node.response_format)) { await sendText(accountId, conversationId, substVars(node.text, s.variables)); await saveSession(accountId, conversationId, s); return true; } if (node?.save_as) s.variables[node.save_as] = text; s.awaiting = null; s.nodeId = node?.next || null; await advance(accountId, conversationId, s, def); return true; }
+    if (session.awaiting === "form") {
+      const fnode = def.nodes[session.node_id]; const ff = ((fnode && fnode.fields) || []).filter((fd) => (fd.label || "").trim()); let fidx = s.variables.__form_idx || 0; const fans = s.variables.__form_answers || {}; const cur = ff[fidx];
+      if (cur) { const k = cur.key || ("field_" + (fidx + 1)); fans[k] = text; s.variables[k] = text; } fidx++; s.variables.__form_answers = fans; s.variables.__form_idx = fidx;
+      if (fidx < ff.length) { await sendFormField(accountId, conversationId, { ...ff[fidx], label: substVars(ff[fidx].label, s.variables) }); await saveSession(accountId, conversationId, s); return true; }
+      const summary = "📋 *Form submitted:*\n" + ff.map((fd, i) => `• ${fd.key || ("field_" + (i + 1))}: ${fans[fd.key || ("field_" + (i + 1))] || "-"}`).join("\n");
+      await sendText(accountId, conversationId, summary); if (fnode && fnode.submit_message) await sendText(accountId, conversationId, fnode.submit_message);
+      if (fnode && fnode.sheet_url) { try { const _ci = await getConvInfo(accountId, conversationId); await appendToSheet(fnode.sheet_url, { Time: new Date().toLocaleString(), Phone: (_ci && _ci.number) || "", ...fans }); } catch (e) {} }
+      delete s.variables.__form_idx; delete s.variables.__form_answers; s.awaiting = null; s.nodeId = (fnode && fnode.next) || null; await advance(accountId, conversationId, s, def); return true;
+    }
+    if (session.awaiting === "catalog") {
+      const cnode = def.nodes[session.node_id]; const prods = ((cnode && cnode.products) || []).filter((p) => (p.name || "").trim()); const cart = s.variables.__cart || []; const stage = s.variables.__cat_stage || "pick";
+      const addL = ((cnode && cnode.add_more_label) || "➕ Add more").slice(0, 20); const coL = ((cnode && cnode.checkout_label) || "✅ Confirm").slice(0, 20); const t = (text || "").trim();
+      if (stage === "pick") { let idx = -1; const num = parseInt(t.replace(/[^\d]/g, ""), 10); if (num >= 1 && num <= prods.length && String(num) === t.replace(/[^\d]/g, "")) idx = num - 1; if (idx < 0) idx = prods.findIndex((p) => catProductTitle(p) === t || (p.name || "").trim().toLowerCase() === t.toLowerCase()); if (idx < 0) { await sendCatalogProducts(accountId, conversationId, prods); await saveSession(accountId, conversationId, s); return true; } s.variables.__cat_pick = idx; s.variables.__cat_stage = "qty"; await sendCatalogQty(accountId, conversationId, cnode, prods[idx]); await saveSession(accountId, conversationId, s); return true; }
+      if (stage === "qty") { const qty = parseInt(t.replace(/[^\d]/g, ""), 10); const pIdx = s.variables.__cat_pick; const prod = prods[pIdx]; if (!prod || !qty || qty < 1) { if (prod) await sendCatalogQty(accountId, conversationId, cnode, prod); await saveSession(accountId, conversationId, s); return true; } const lineTotal = (Number(prod.price) || 0) * qty; const existing = cart.find((it) => it.name === prod.name); if (existing) existing.qty = (Number(existing.qty) || 0) + qty; else cart.push({ name: prod.name, price: Number(prod.price) || 0, qty }); s.variables.__cart = cart; await sendText(accountId, conversationId, buildCartMsg(cnode, cart, prod, qty, lineTotal)); s.variables.__cat_stage = "more"; await sendCatalogMore(accountId, conversationId, cnode); await saveSession(accountId, conversationId, s); return true; }
+      if (stage === "more") { if (t === addL || /add|aur|more|zyada/i.test(t)) { s.variables.__cat_stage = "pick"; await sendCatalogProducts(accountId, conversationId, prods); await saveSession(accountId, conversationId, s); return true; } if (t === coL || /check?out|complete|done|order|confirm|ho?gaya|bas/i.test(t)) { const ff = ((cnode && cnode.fields) || []).filter((fd) => (fd.label || "").trim()); s.variables.__cat_stage = "form"; s.variables.__form_idx = 0; s.variables.__form_answers = {}; if (ff.length) { await sendFormField(accountId, conversationId, ff[0]); await saveSession(accountId, conversationId, s); return true; } await finishCatalogOrder(accountId, conversationId, s, def, cnode, cart, {}); return true; } await sendCatalogMore(accountId, conversationId, cnode); await saveSession(accountId, conversationId, s); return true; }
+      if (stage === "form") { const ff = ((cnode && cnode.fields) || []).filter((fd) => (fd.label || "").trim()); let fidx = s.variables.__form_idx || 0; const fans = s.variables.__form_answers || {}; const cur = ff[fidx]; if (cur) { const k = cur.key || ("field_" + (fidx + 1)); fans[k] = t; s.variables[k] = t; } fidx++; s.variables.__form_answers = fans; s.variables.__form_idx = fidx; if (fidx < ff.length) { await sendFormField(accountId, conversationId, { ...ff[fidx], label: substVars(ff[fidx].label, s.variables) }); await saveSession(accountId, conversationId, s); return true; } await finishCatalogOrder(accountId, conversationId, s, def, cnode, cart, fans); return true; }
+      await saveSession(accountId, conversationId, s); return true;
+    }
+    const mc = resolveMenuChoice(def, s, text, input);
+    if (mc) { const mNode = def.nodes[mc.menuId]; s.nodeId = mc.next; s.awaiting = null; await advance(accountId, conversationId, s, def); if (mNode && mNode.loop_menu && !s.awaiting && !s.nodeId) { s.nodeId = mc.menuId; await advance(accountId, conversationId, s, def); } return true; }
+    if (input) return false;
+    if (session.awaiting === "buttons" || session.awaiting === "list") { const cur = def.nodes[session.node_id]; if (cur && cur.loop_menu) { s.nodeId = session.node_id; s.awaiting = null; await advance(accountId, conversationId, s, def); } else { await saveSession(accountId, conversationId, s); } return true; }
+    return false;
+}
 app.post("/webhook", async (req, res) => {
   res.sendStatus(200);
   try {
-    const event = req.body; const accountId = event.account?.id; const conversationId = event.conversation?.id; const inboxId = event.conversation?.inbox_id ?? event.inbox?.id ?? event.conversation?.inbox?.id ?? null;
+    const event = req.body; const originalEvent = event.event; const accountId = event.account?.id; const conversationId = event.conversation?.id; const inboxId = event.conversation?.inbox_id ?? event.inbox?.id ?? event.conversation?.inbox?.id ?? null;
     if (!accountId || !conversationId) return;
     const _sender = event.sender || event.conversation?.meta?.sender || {}; const senderVars = { senderName: _sender.name || _sender.available_name || "", senderId: _sender.phone_number || _sender.identifier || "", receiverId: event.conversation?.meta?.channel_source_id || event.inbox?.phone_number || "", };
     const flowRow = await cachedPublishedFlow(accountId, inboxId); if (!flowRow) return; const def = parseDef(flowRow.definition); if (!def.start) return;
@@ -925,35 +962,55 @@ app.post("/webhook", async (req, res) => {
         else { const mc = resolveMenuChoice(def, s, choice); if (mc) { const mNode = def.nodes[mc.menuId]; s.nodeId = mc.next; s.awaiting = null; await advance(accountId, conversationId, s, def); if (mNode && mNode.loop_menu && !s.awaiting && !s.nodeId) { s.nodeId = mc.menuId; await advance(accountId, conversationId, s, def); } } else if (s.awaiting === "buttons" || s.awaiting === "list") { const cur = def.nodes[s.nodeId]; if (cur && cur.loop_menu) { s.awaiting = null; await advance(accountId, conversationId, s, def); } } return; }
       } else return;
     }
-    if (event.event !== "message_created") return; if (event.message_type !== "incoming") return; const text = (event.content || "").trim();
-    const isRepublished = session && session.flow_published_at && new Date(session.flow_published_at).getTime() < new Date(flowPublishedAt).getTime();
-    if (!session || isRepublished) { const trig = def.trigger || {}; if (trig.keywords && trig.keywords.length && !matchKeywords(text, trig.keywords, trig.fuzzy, trig.sensitivity)) return; openConversation(accountId, conversationId); const s = { nodeId: def.start, awaiting: null, variables: { last_message: text, message: text, __inbox: inboxId, ...senderVars }, flowPublishedAt }; await advance(accountId, conversationId, s, def); return; }
-    const s = toSession(session, flowPublishedAt); s.variables.last_message = text; s.variables.message = text; s.variables.__inbox = inboxId; Object.assign(s.variables, senderVars);
-    if (session.awaiting === "appointment") { await saveSession(accountId, conversationId, s); return; }
-    if (session.awaiting === "question") { const node = def.nodes[session.node_id]; if (node && node.response_format && !validateFormat(text, node.response_format)) { await sendText(accountId, conversationId, substVars(node.text, s.variables)); await saveSession(accountId, conversationId, s); return; } if (node?.save_as) s.variables[node.save_as] = text; s.awaiting = null; s.nodeId = node?.next || null; await advance(accountId, conversationId, s, def); return; }
-    if (session.awaiting === "form") {
-      const fnode = def.nodes[session.node_id]; const ff = ((fnode && fnode.fields) || []).filter((fd) => (fd.label || "").trim()); let fidx = s.variables.__form_idx || 0; const fans = s.variables.__form_answers || {}; const cur = ff[fidx];
-      if (cur) { const k = cur.key || ("field_" + (fidx + 1)); fans[k] = text; s.variables[k] = text; } fidx++; s.variables.__form_answers = fans; s.variables.__form_idx = fidx;
-      if (fidx < ff.length) { await sendFormField(accountId, conversationId, { ...ff[fidx], label: substVars(ff[fidx].label, s.variables) }); await saveSession(accountId, conversationId, s); return; }
-      const summary = "📋 *Form submitted:*\n" + ff.map((fd, i) => `• ${fd.key || ("field_" + (i + 1))}: ${fans[fd.key || ("field_" + (i + 1))] || "-"}`).join("\n");
-      await sendText(accountId, conversationId, summary); if (fnode && fnode.submit_message) await sendText(accountId, conversationId, fnode.submit_message);
-      if (fnode && fnode.sheet_url) { try { const _ci = await getConvInfo(accountId, conversationId); await appendToSheet(fnode.sheet_url, { Time: new Date().toLocaleString(), Phone: (_ci && _ci.number) || "", ...fans }); } catch (e) {} }
-      delete s.variables.__form_idx; delete s.variables.__form_answers; s.awaiting = null; s.nodeId = (fnode && fnode.next) || null; await advance(accountId, conversationId, s, def); return;
-    }
-    if (session.awaiting === "catalog") {
-      const cnode = def.nodes[session.node_id]; const prods = ((cnode && cnode.products) || []).filter((p) => (p.name || "").trim()); const cart = s.variables.__cart || []; const stage = s.variables.__cat_stage || "pick";
-      const addL = ((cnode && cnode.add_more_label) || "➕ Add more").slice(0, 20); const coL = ((cnode && cnode.checkout_label) || "✅ Confirm").slice(0, 20); const t = (text || "").trim();
-      if (stage === "pick") { let idx = -1; const num = parseInt(t.replace(/[^\d]/g, ""), 10); if (num >= 1 && num <= prods.length && String(num) === t.replace(/[^\d]/g, "")) idx = num - 1; if (idx < 0) idx = prods.findIndex((p) => catProductTitle(p) === t || (p.name || "").trim().toLowerCase() === t.toLowerCase()); if (idx < 0) { await sendCatalogProducts(accountId, conversationId, prods); await saveSession(accountId, conversationId, s); return; } s.variables.__cat_pick = idx; s.variables.__cat_stage = "qty"; await sendCatalogQty(accountId, conversationId, cnode, prods[idx]); await saveSession(accountId, conversationId, s); return; }
-      if (stage === "qty") { const qty = parseInt(t.replace(/[^\d]/g, ""), 10); const pIdx = s.variables.__cat_pick; const prod = prods[pIdx]; if (!prod || !qty || qty < 1) { if (prod) await sendCatalogQty(accountId, conversationId, cnode, prod); await saveSession(accountId, conversationId, s); return; } const lineTotal = (Number(prod.price) || 0) * qty; const existing = cart.find((it) => it.name === prod.name); if (existing) existing.qty = (Number(existing.qty) || 0) + qty; else cart.push({ name: prod.name, price: Number(prod.price) || 0, qty }); s.variables.__cart = cart; await sendText(accountId, conversationId, buildCartMsg(cnode, cart, prod, qty, lineTotal)); s.variables.__cat_stage = "more"; await sendCatalogMore(accountId, conversationId, cnode); await saveSession(accountId, conversationId, s); return; }
-      if (stage === "more") { if (t === addL || /add|aur|more|zyada/i.test(t)) { s.variables.__cat_stage = "pick"; await sendCatalogProducts(accountId, conversationId, prods); await saveSession(accountId, conversationId, s); return; } if (t === coL || /check?out|complete|done|order|confirm|ho?gaya|bas/i.test(t)) { const ff = ((cnode && cnode.fields) || []).filter((fd) => (fd.label || "").trim()); s.variables.__cat_stage = "form"; s.variables.__form_idx = 0; s.variables.__form_answers = {}; if (ff.length) { await sendFormField(accountId, conversationId, ff[0]); await saveSession(accountId, conversationId, s); return; } await finishCatalogOrder(accountId, conversationId, s, def, cnode, cart, {}); return; } await sendCatalogMore(accountId, conversationId, cnode); await saveSession(accountId, conversationId, s); return; }
-      if (stage === "form") { const ff = ((cnode && cnode.fields) || []).filter((fd) => (fd.label || "").trim()); let fidx = s.variables.__form_idx || 0; const fans = s.variables.__form_answers || {}; const cur = ff[fidx]; if (cur) { const k = cur.key || ("field_" + (fidx + 1)); fans[k] = t; s.variables[k] = t; } fidx++; s.variables.__form_answers = fans; s.variables.__form_idx = fidx; if (fidx < ff.length) { await sendFormField(accountId, conversationId, { ...ff[fidx], label: substVars(ff[fidx].label, s.variables) }); await saveSession(accountId, conversationId, s); return; } await finishCatalogOrder(accountId, conversationId, s, def, cnode, cart, fans); return; }
-      await saveSession(accountId, conversationId, s); return;
-    }
-    const mc = resolveMenuChoice(def, s, text);
-    if (mc) { const mNode = def.nodes[mc.menuId]; s.nodeId = mc.next; s.awaiting = null; await advance(accountId, conversationId, s, def); if (mNode && mNode.loop_menu && !s.awaiting && !s.nodeId) { s.nodeId = mc.menuId; await advance(accountId, conversationId, s, def); } return; }
-    if (session.awaiting === "buttons" || session.awaiting === "list") { const cur = def.nodes[session.node_id]; if (cur && cur.loop_menu) { s.nodeId = session.node_id; s.awaiting = null; await advance(accountId, conversationId, s, def); } else { await saveSession(accountId, conversationId, s); } return; }
+    if (event.event !== "message_created") return; if (event.message_type !== "incoming") return;
+    // The ChatsSync AI answers this chat too: it hands each message to the flow first (POST /api/ai/route).
+    if (originalEvent === "message_created" && event.chatssync && event.chatssync.ai_routes) return;
+    await handleIncoming(accountId, conversationId, inboxId, (event.content || "").trim(), senderVars);
     return;
   } catch (e) { console.error("webhook error:", e.message); }
+});
+
+/* ===== AI + chatbot flow =====
+   The ChatsSync AI and the chatbot flow can answer the same chat (AI settings > "Use my chatbot flows").
+   ChatsSync gives each customer message to the flow first (/api/ai/route). What the flow does not use, the AI
+   answers, and the AI can answer with one box of the flow (/api/ai/send-box); that box's buttons then continue the flow. */
+const AI_BOX_TYPES = ["text", "media", "cta", "buttons", "list", "catalog", "form", "appointment"];
+function boxSummary(id, node) {
+  const text = node.text || node.body || node.caption || node.intro || (node.header && node.header.type === "text" ? node.header.value : "") || "";
+  const options = node.type === "buttons" ? (node.buttons || []).map((b) => b && b.title) : node.type === "list" ? listRows(node).map((r) => r && r.title) : node.type === "catalog" ? (node.products || []).map((p) => p && p.name) : [];
+  return { id, type: node.type, text: String(text).replace(/\s+/g, " ").trim().slice(0, 220), options: options.filter(Boolean).slice(0, 10) };
+}
+// True when the flow reached a "Talk to a human" box during this call, so ChatsSync stops the AI in this chat.
+async function handedOverSince(a, c, started) { const row = await getSession(a, c); if (!row) return false; const v = typeof row.variables === "string" ? JSON.parse(row.variables) : (row.variables || {}); return (v.__handover_at || 0) >= started; }
+app.use("/api/ai", (req, res, next) => (req.csAccountId ? next() : res.status(401).json({ error: "unauthorized" })));
+app.get("/api/ai/boxes", async (req, res) => {
+  try {
+    const flowRow = await cachedPublishedFlow(req.csAccountId, parseInt(req.query.inbox_id, 10)); if (!flowRow) return res.json({ boxes: [] });
+    const def = parseDef(flowRow.definition);
+    const boxes = Object.entries(def.nodes || {}).filter(([, n]) => n && AI_BOX_TYPES.includes(n.type)).map(([id, n]) => boxSummary(id, n)).filter((b) => b.text || b.options.length);
+    res.json({ flow: flowRow.name, boxes: boxes.slice(0, 60) });
+  } catch (e) { console.error("ai/boxes", e.message); res.status(500).json({ error: e.message }); }
+});
+app.post("/api/ai/route", async (req, res) => {
+  try {
+    const { conversation_id, inbox_id, text, mode, sender } = req.body || {};
+    const senderVars = { senderName: (sender && sender.name) || "", senderId: (sender && sender.phone) || "", receiverId: "" };
+    const started = Date.now(); const c = parseInt(conversation_id, 10);
+    const handled = await handleIncoming(req.csAccountId, c, parseInt(inbox_id, 10), String(text || "").trim(), senderVars, mode === "full" ? "full" : "input");
+    res.json({ handled, handover: await handedOverSince(req.csAccountId, c, started) });
+  } catch (e) { console.error("ai/route", e.message); res.status(500).json({ error: e.message }); }
+});
+app.post("/api/ai/send-box", async (req, res) => {
+  try {
+    const { conversation_id, inbox_id, box_id, sender } = req.body || {}; const a = req.csAccountId; const c = parseInt(conversation_id, 10); const inboxId = parseInt(inbox_id, 10);
+    const flowRow = await cachedPublishedFlow(a, inboxId); if (!flowRow) return res.status(404).json({ error: "no published flow" });
+    const def = parseDef(flowRow.definition); const node = def.nodes && def.nodes[box_id]; if (!node || !AI_BOX_TYPES.includes(node.type)) return res.status(404).json({ error: "box not found" });
+    const flowPublishedAt = new Date(flowRow.published_at).toISOString(); const row = await getSession(a, c);
+    const s = row ? toSession(row, flowPublishedAt) : { variables: {} }; s.flowPublishedAt = flowPublishedAt; s.nodeId = box_id; s.awaiting = null;
+    Object.assign(s.variables, { __inbox: inboxId, senderName: (sender && sender.name) || s.variables.senderName || "", senderId: (sender && sender.phone) || s.variables.senderId || "" });
+    const started = Date.now(); await advance(a, c, s, def);
+    res.json({ ok: true, handover: await handedOverSince(a, c, started) });
+  } catch (e) { console.error("ai/send-box", e.message); res.status(500).json({ error: e.message }); }
 });
 
 /* =====================================================================
